@@ -1,0 +1,5 @@
+{
+  "users":["alice"],
+  "directory":{"report.txt":1,"demo.txt":1,"udtest.txt":1},
+  "acls":{"udtest.txt":{"owner":"owner","grants":{"anonymous":"RW"}}}
+}
