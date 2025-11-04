@@ -24,6 +24,87 @@ Build
 make -s all
 ```
 
+## How to run and verify all features (single and multiple users)
+
+1) Start the servers (one NM and two SS)
+
+```bash
+# Terminal 1: Name Manager (NM)
+./bin/nm 5000
+
+# Terminal 2: Storage Server #1 (id=1)
+./bin/ss 127.0.0.1 5000 6001 6002 1
+
+# Terminal 3: Storage Server #2 (id=2)
+./bin/ss 127.0.0.1 5000 6003 6004 2
+```
+
+2) Launch two clients (multi-user)
+
+```bash
+# Terminal 4 (User alice)
+./bin/client 127.0.0.1 5000
+# When prompted: alice
+
+# Terminal 5 (User bob)
+./bin/client 127.0.0.1 5000
+# When prompted: bob
+```
+
+3) Verify core commands
+
+- In either client: `VIEW`, `VIEW -l`, `VIEW -a`, `VIEW -al`
+- As alice: `CREATE demo.txt`
+- `READ demo.txt`, `INFO demo.txt`, `STREAM demo.txt`
+- `DELETE demo.txt`
+
+4) Verify writing with sentence-level locking (concurrency)
+
+- Alice: `CREATE demo.txt` then `WRITE demo.txt 0` → enter `0 Hello world.` then `ETIRW`
+- Bob in parallel: `WRITE demo.txt 0` while alice is writing → should see `ERROR: locked`
+- After alice finishes, Bob retries `WRITE demo.txt 0` → now succeeds
+- Bob can `READ demo.txt` at any time; it returns the last committed content
+
+5) Verify UNDO, HISTORY, REVERT
+
+- `UNDO demo.txt`
+- `HISTORY demo.txt`
+- `REVERT demo.txt 1`
+
+6) Verify checkpoints (bonus)
+
+- `checkpoint demo.txt snap1`
+- `list-checkpoints demo.txt`
+- `view-checkpoint demo.txt snap1`
+- `revertc demo.txt snap1`
+
+7) Verify folders (bonus)
+
+- `mkdir docs`
+- `WRITE docs/note.txt 0` → provide lines, then `ETIRW`
+- `mv docs/note.txt docs/notes.txt`
+- `lsf docs`
+
+8) Verify access control (grants and requests)
+
+- Owner grants:
+	- As alice: `ADDACCESS -R demo.txt bob` (R) or `ADDACCESS -W demo.txt bob` (RW)
+	- Remove: `REMACCESS demo.txt bob`
+- Requests workflow:
+	- As bob: `REQUEST_ACCESS demo.txt -R`
+	- As alice: `VIEWREQUESTS demo.txt` → shows pending users
+	- As alice: `APPROVE_ACCESS demo.txt -R bob` (or `DENY_ACCESS demo.txt bob`)
+	- As bob: `READ demo.txt` → should now work after approval
+
+9) Verify STATS and replication/failover (bonus)
+
+- Run `STATS` to see summary: files, activeLocks (stub), replicationQueue
+- With two SSs running, perform a write, then stop the primary SS process → `READ demo.txt` should still work via a replica (NM promotes replicas automatically)
+Tip: A scripted demo is available:
+
+```bash
+./run_test.sh
+```
 Quick run (example on localhost ports 5000/6001/6002)
 
 ```bash
@@ -193,6 +274,7 @@ LIST
 ADDACCESS -R nuh_uh.txt user2
 ADDACCESS -W nuh_uh.txt user2   # implies RW
 REMACCESS nuh_uh.txt user2
+```
 
 Access requests workflow (NM-managed):
 
@@ -204,7 +286,6 @@ REQUEST_ACCESS file.txt -R      # or -W
 VIEWREQUESTS file.txt
 APPROVE_ACCESS file.txt -R user2
 DENY_ACCESS file.txt user2
-```
 ```
 
 11) Execute file (runs on NM and returns output)
@@ -236,6 +317,28 @@ Run a quick end-to-end demo:
 ```
 ./run_test.sh
 ```
+
+## Where data is stored (files and metadata)
+
+- Name Manager (NM) persistent state:
+	- File: `nm_state.json` at the repository root.
+	- Contents include:
+		- `users`: list of known usernames
+		- `directory`: map file → primary SS id
+		- `acls`: per-file `owner` and `grants` (user → R/W/RW)
+		- `folders`: folder structure
+		- `replicas`: map file → [ssIds] (present when replicas are configured)
+		- `requests`: map file → [usernames] (pending access requests; present when used)
+	- The file is backward-compatible: fields appear as features are used.
+
+- Storage Server (SS) on-disk layout:
+	- Each SS stores data under its working directory, inside `ss_data/`:
+		- `ss_data/files/<path>`: the current contents of user files
+		- `ss_data/history/<file>.<version>.snap`: versioned snapshots
+		- `ss_data/undo/<file>.undo`: single-level undo snapshot
+		- `ss_data/checkpoints/<file>.<name>.snap`: named checkpoints
+		- `ss_data/meta/`: miscellaneous metadata (reserved)
+	- Tip: Run each SS from its own working directory to keep data isolated. The provided `run_test.sh` uses separate temporary directories for SS1 and SS2.
 
 Error messages follow the spec format, e.g., `ERROR: not found`, `ERROR: permission denied`, etc.
 
