@@ -5,6 +5,25 @@
 
 #include "../common/net_proto.h"
 
+// Forward declaration for reuse in REPL
+static int client_handle_oneshot(int argc, char **argv, const char *username);
+
+// Tiny helpers
+static void rstrip(char *s){ if(!s) return; size_t n=strlen(s); while(n && (s[n-1]=='\n'||s[n-1]=='\r'||s[n-1]==' '||s[n-1]=='\t')) s[--n]='\0'; }
+static int tokenize(const char *line, char **outv, int maxv){
+    int argc=0; const char *p=line; while(*p==' '||*p=='\t') p++;
+    while(*p && argc<maxv){
+        while(*p==' '||*p=='\t') p++;
+        if(!*p) break;
+        const char *start=p; int inq=0; if(*p=='"'){ inq=1; start=++p; }
+        const char *q=p; while(*q){ if(inq){ if(*q=='"'){ break; } } else { if(*q==' '||*q=='\t'||*q=='\n') break; } q++; }
+        size_t len=(size_t)(q-start); char *tok=(char*)malloc(len+1); if(!tok) break; memcpy(tok,start,len); tok[len]='\0'; outv[argc++]=tok;
+        p=q; if(inq && *p=='"') p++; while(*p==' '||*p=='\t') p++;
+    }
+    return argc;
+}
+static void free_tokens(char **v, int n){ for(int i=0;i<n;i++) free(v[i]); }
+
 static void print_human(const char *who, const char *json) {
     if (!json) { fprintf(stderr, "%s: (no response)\n", who); return; }
     char status[64]; status[0]='\0';
@@ -20,6 +39,33 @@ static void print_human(const char *who, const char *json) {
         // HISTORY: versions list
         if (strstr(json, "\"versions\":")) {
             printf("OK: versions listed\n");
+            return;
+        }
+        // VIEWREQUESTS: requests list
+        if (strstr(json, "\"requests\":[")) {
+            printf("Requests:\n");
+            const char *p = strstr(json, "["); if (!p) { printf("(none)\n"); return; }
+            p++;
+            int count = 0;
+            while (*p && *p!=']') {
+                while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                if (*p=='"') {
+                    p++; const char *s=p; while(*p && *p!='"') p++; size_t n=(size_t)(p-s);
+                    char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0';
+                    printf("- %s\n", name); count++;
+                    if (*p=='"') p++;
+                } else break;
+            }
+            if (count==0) printf("(none)\n");
+            return;
+        }
+        // STATS summary
+        if (strstr(json, "\"replicationQueue\":")) {
+            int files=0, locks=0, rq=0;
+            (void)json_get_int_field(json, "files", &files);
+            (void)json_get_int_field(json, "activeLocks", &locks);
+            (void)json_get_int_field(json, "replicationQueue", &rq);
+            printf("OK: files=%d, activeLocks=%d, replicationQueue=%d\n", files, locks, rq);
             return;
         }
         // LISTCHECKPOINTS: checkpoints list
@@ -125,60 +171,56 @@ static void print_human(const char *who, const char *json) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 4) {
-        fprintf(stderr, "Usage:\n");
-        fprintf(stderr, "  %s <nm_host> <nm_port> VIEW [-a] [-l]\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> READ <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> CREATE <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> WRITE <file> <sentenceIndex>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> UNDO <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> INFO <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> DELETE <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> STREAM <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> LIST\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> ADDACCESS -R|-W <file> <user>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> REMACCESS <file> <user>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> EXEC <file>\n", argv[0]);
-        // debug/bonus helpers kept:
-        fprintf(stderr, "  %s <nm_host> <nm_port> dir-set <file> <ssId>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> rename <old> <new>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> read <file>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> read-noticket <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> create <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> delete <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> write <file> <sentenceIndex> <wordIndex> <content>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> undo <file>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> history <file>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> revert <file> <version>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> rename <old> <new>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> migrate <file> <targetSsId>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> addaccess <file> <user> <R|W|RW>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> remaccess <file> <user>\n", argv[0]);
-    fprintf(stderr, "  %s <nm_host> <nm_port> put-direct <ssDataPort> <file> <body>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> mkdir <path>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> lsf <path>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> mv <src> <dst>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> checkpoint <file> <name>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> list-checkpoints <file>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> view-checkpoint <file> <name>\n", argv[0]);
-        fprintf(stderr, "  %s <nm_host> <nm_port> revertc <file> <name>\n", argv[0]);
-        return 1;
+    // Interactive REPL mode only; optional host/port override
+    char nm_host[64]; snprintf(nm_host, sizeof(nm_host), "%s", "127.0.0.1");
+    uint16_t nm_port = 5000;
+    if (argc == 3) { snprintf(nm_host, sizeof(nm_host), "%s", argv[1]); nm_port = (uint16_t)atoi(argv[2]); }
+    else if (argc != 1) {
+        fprintf(stderr, "[CLI] One-shot mode has been removed. Starting interactive shell. To set host/port, run: %s <host> <port>\n", argv[0]);
     }
-    const char *nm_host = argv[1];
-    uint16_t nm_port = (uint16_t)atoi(argv[2]);
-    const char *cmd = argv[3];
-    // Ask username and send CLIENT_HELLO
+
     char username[128];
     fprintf(stdout, "Enter username: "); fflush(stdout);
     if (!fgets(username, sizeof(username), stdin)) { fprintf(stderr, "Failed to read username\n"); return 1; }
-    // strip newline
-    size_t ulen = strlen(username); if (ulen && username[ulen-1]=='\n') username[--ulen]='\0';
+    rstrip(username);
+    // Say hello once
     int hfd = tcp_connect(nm_host, nm_port);
     if (hfd >= 0) {
         char hello[256]; hello[0]='\0'; json_put_string_field(hello, sizeof(hello), "type", "CLIENT_HELLO", 1); json_put_string_field(hello, sizeof(hello), "user", username, 0); strncat(hello, "}", sizeof(hello)-strlen(hello)-1);
         (void)send_msg(hfd, hello, (uint32_t)strlen(hello)); char *hr=NULL; uint32_t hrl=0; (void)recv_msg(hfd, &hr, &hrl); free(hr); close(hfd);
+    } else {
+        fprintf(stderr, "[CLI] Could not connect to NM at %s:%u (will try per command)\n", nm_host, (unsigned)nm_port);
     }
+    printf("Welcome to Docs++ shell. Connected to %s:%u as %s. Type 'help' or 'exit'.\n", nm_host, (unsigned)nm_port, username);
+    char line[2048];
+    for (;;) {
+        printf("docs> "); fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
+        rstrip(line);
+        if (!line[0]) continue;
+        if (strcmp(line, "exit")==0 || strcmp(line, "quit")==0) break;
+        if (strcmp(line, "help")==0) {
+            printf("Commands: VIEW [-a] [-l] | READ <file> | CREATE <file> | WRITE <file> <sentenceIndex> | UNDO <file> | INFO <file> | DELETE <file> | STREAM <file> | LIST | ADDACCESS -R|-W <file> <user> | REMACCESS <file> <user> | REQUEST_ACCESS <file> [-R|-W] | VIEWREQUESTS <file> | APPROVE_ACCESS <file> -R|-W <user> | DENY_ACCESS <file> <user> | STATS | EXEC <file>\n");
+            continue;
+        }
+        // Tokenize
+        char *tokv[64]; int tn = tokenize(line, tokv, 64);
+        if (tn <= 0) continue;
+        // Build argv: program, host, port, then tokens
+        char portbuf[16]; snprintf(portbuf, sizeof(portbuf), "%u", (unsigned)nm_port);
+        char *argv2[70]; int ac=0; argv2[ac++] = argv[0]; argv2[ac++] = nm_host; argv2[ac++] = portbuf;
+        for (int i=0;i<tn && ac<70;i++) argv2[ac++] = tokv[i];
+        (void)client_handle_oneshot(ac, argv2, username);
+        free_tokens(tokv, tn);
+    }
+    return 0;
+}
 
+// The existing one-shot implementation, refactored into a function
+static int client_handle_oneshot(int argc, char **argv, const char *username) {
+    const char *nm_host = argv[1];
+    uint16_t nm_port = (uint16_t)atoi(argv[2]);
+    const char *cmd = argv[3];
     int fd = tcp_connect(nm_host, nm_port);
     if (fd < 0) { perror("connect NM"); return 1; }
 
@@ -576,6 +618,46 @@ int main(int argc, char **argv) {
         json_put_string_field(payload, sizeof(payload), "type", "MOVE", 1);
         json_put_string_field(payload, sizeof(payload), "src", src, 0);
         json_put_string_field(payload, sizeof(payload), "dst", dst, 0);
+        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+    } else if (strcmp(cmd, "REQUEST_ACCESS") == 0 || strcmp(cmd, "request-access") == 0) {
+        if (argc < 5) { fprintf(stderr, "REQUEST_ACCESS requires <file> [ -R | -W ]\n"); close(fd); return 1; }
+        const char *file = argv[4]; const char *mode = "R";
+        if (argc >= 6) {
+            if (strcmp(argv[5], "-W") == 0) mode = "W";
+            else if (strcmp(argv[5], "-R") == 0) mode = "R";
+        }
+        json_put_string_field(payload, sizeof(payload), "type", "REQUEST_ACCESS", 1);
+        json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
+        json_put_string_field(payload, sizeof(payload), "mode", mode, 0);
+        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+    } else if (strcmp(cmd, "VIEWREQUESTS") == 0 || strcmp(cmd, "viewrequests") == 0) {
+        if (argc < 5) { fprintf(stderr, "VIEWREQUESTS requires <file>\n"); close(fd); return 1; }
+        const char *file = argv[4];
+        json_put_string_field(payload, sizeof(payload), "type", "VIEWREQUESTS", 1);
+        json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
+        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+    } else if (strcmp(cmd, "APPROVE_ACCESS") == 0 || strcmp(cmd, "approve-access") == 0) {
+        if (argc < 7) { fprintf(stderr, "APPROVE_ACCESS requires <file> -R|-W <user>\n"); close(fd); return 1; }
+        const char *file = argv[4]; const char *flag = argv[5]; const char *user = argv[6]; const char *mode = (strcmp(flag, "-W")==0?"W":"R");
+        json_put_string_field(payload, sizeof(payload), "type", "APPROVE_ACCESS", 1);
+        json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "target", user, 0);
+        json_put_string_field(payload, sizeof(payload), "mode", mode, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
+        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+    } else if (strcmp(cmd, "DENY_ACCESS") == 0 || strcmp(cmd, "deny-access") == 0) {
+        if (argc < 6) { fprintf(stderr, "DENY_ACCESS requires <file> <user>\n"); close(fd); return 1; }
+        const char *file = argv[4]; const char *user = argv[5];
+        json_put_string_field(payload, sizeof(payload), "type", "DENY_ACCESS", 1);
+        json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "target", user, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
+        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
+    } else if (strcmp(cmd, "STATS") == 0 || strcmp(cmd, "stats") == 0) {
+        json_put_string_field(payload, sizeof(payload), "type", "STATS", 1);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
     } else if (strcmp(cmd, "checkpoint") == 0) {
         if (argc < 6) { fprintf(stderr, "checkpoint requires <file> <name>\n"); close(fd); return 1; }

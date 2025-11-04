@@ -35,6 +35,16 @@ int nm_state_del_dir(const char *file);
 // Rename mapping key; returns 1 if renamed, 0 if src not found or dst exists
 int nm_state_rename_dir(const char *old_file, const char *new_file);
 
+// --- Replication metadata (bonus) ---
+// Set full replica list for a file (array of ssIds). Returns 1 on change, 0 if unchanged, -1 on error.
+int nm_state_set_replicas(const char *file, const int *replicas, size_t n);
+
+// Copy up to max replica ssIds into out; returns number of replicas. 0 if none.
+size_t nm_state_get_replicas(const char *file, int *out, size_t max);
+
+// Convenience: get primary ssId for a file (wraps directory mapping). Returns 0 on success, -1 if not found.
+int nm_state_get_primary(const char *file, int *out_ssid);
+
 // --- ACLs (M7) ---
 // Permissions bitmask
 #define ACL_R 1
@@ -75,5 +85,15 @@ size_t nm_state_get_folders(char folders[][256], size_t max_entries);
 // Returns number of files remapped (>=0). Does not contact SS (caller must orchestrate renames).
 int nm_state_move_folder_prefix(const char *old_path, const char *new_path,
 								char files[][128], char new_files[][128], int ssids[], size_t max_files);
+
+// --- Access Requests (bonus) ---
+// Add a pending access request for file by username; returns 1 if added, 0 if already present or file unknown
+int nm_state_add_request(const char *file, const char *user);
+
+// List pending requests for file into users array; returns count
+size_t nm_state_list_requests(const char *file, char users[][128], size_t max_users);
+
+// Remove a pending request for file by username; returns 1 if removed, 0 if not present
+int nm_state_remove_request(const char *file, const char *user);
 
 #endif // NM_PERSIST_H

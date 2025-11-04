@@ -14,7 +14,7 @@ typedef struct {
     char **users;
     size_t n_users;
     size_t cap_users;
-    struct dir_entry { char *file; int ss_id; } *dir;
+    struct dir_entry { char *file; int ss_id; int *replicas; size_t n_repl; size_t cap_repl; } *dir;
     size_t n_dir;
     size_t cap_dir;
     struct acl_entry { char *file; char *owner; struct acl_user *grants; size_t n_grants; size_t cap_grants; } *acls;
@@ -24,6 +24,10 @@ typedef struct {
     char **folders;
     size_t n_folders;
     size_t cap_folders;
+    // Access requests per file
+    struct req_entry { char *file; char **users; size_t n_users; size_t cap_users; } *requests;
+    size_t n_requests;
+    size_t cap_requests;
 } nm_state_t;
 
 static nm_state_t g_state;
@@ -89,8 +93,8 @@ static int write_atomic(const char *path, const char *data, size_t len) {
 }
 
 int nm_state_save(const char *path) {
-    // Compose JSON: users, directory, acls
-    size_t bufcap = 4096 + g_state.n_users * 64 + g_state.n_dir * 128 + g_state.n_acls * 256 + g_state.n_folders * 64;
+    // Compose JSON: users, directory, acls, replicas, requests, folders
+    size_t bufcap = 8192 + g_state.n_users * 64 + g_state.n_dir * 160 + g_state.n_acls * 320 + g_state.n_folders * 64;
     char *buf = (char *)malloc(bufcap);
     if (!buf) return -1;
     buf[0] = '\0';
@@ -147,6 +151,36 @@ int nm_state_save(const char *path) {
             strcat(buf, "\"");
         }
         strcat(buf, "}}");
+    }
+    strcat(buf, "},\n  \"replicas\":{");
+    for (size_t i = 0; i < g_state.n_dir; ++i) {
+        if (i) strcat(buf, ",");
+        strcat(buf, "\"");
+        const char *s = g_state.dir[i].file;
+        for (; s && *s; ++s) { if (*s == '"' || *s == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}        
+        strcat(buf, "\":[");
+        for (size_t j=0;j<g_state.dir[i].n_repl;j++) {
+            if (j) strcat(buf, ",");
+            char num[32]; snprintf(num, sizeof(num), "%d", g_state.dir[i].replicas[j]);
+            strncat(buf, num, bufcap - strlen(buf) - 1);
+        }
+        strcat(buf, "]");
+    }
+    strcat(buf, "},\n  \"requests\":{");
+    for (size_t i=0;i<g_state.n_requests;i++) {
+        if (i) strcat(buf, ",");
+        strcat(buf, "\"");
+        const char *s = g_state.requests[i].file;
+        for (; s && *s; ++s) { if (*s == '"' || *s == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}        
+        strcat(buf, "\":[");
+        for (size_t j=0;j<g_state.requests[i].n_users;j++) {
+            if (j) strcat(buf, ",");
+            strcat(buf, "\"");
+            const char *u = g_state.requests[i].users[j];
+            for (; u && *u; ++u) { if (*u == '"' || *u == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*u,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}            
+            strcat(buf, "\"");
+        }
+        strcat(buf, "]");
     }
     strcat(buf, "},\n  \"folders\":[");
     for (size_t i = 0; i < g_state.n_folders; ++i) {
@@ -232,6 +266,8 @@ static void parse_directory_object(const char *json) {
 
 // Forward decl for folders JSON parser
 static void parse_folders_array(const char *json);
+static void parse_replicas_object(const char *json);
+static void parse_requests_object(const char *json);
 
 int nm_state_load(const char *path) {
     FILE *f = fopen(path, "rb");
@@ -309,6 +345,9 @@ int nm_state_load(const char *path) {
             }
         }
     }
+    // Parse replicas and requests (optional, backward-compatible)
+    parse_replicas_object(buf);
+    parse_requests_object(buf);
     // Parse folders
     parse_folders_array(buf);
     free(buf);
@@ -338,6 +377,7 @@ int nm_state_set_dir(const char *file, int ss_id) {
     g_state.dir[g_state.n_dir].file = strdup(file);
     if (!g_state.dir[g_state.n_dir].file) return 0;
     g_state.dir[g_state.n_dir].ss_id = ss_id;
+    g_state.dir[g_state.n_dir].replicas = NULL; g_state.dir[g_state.n_dir].n_repl = 0; g_state.dir[g_state.n_dir].cap_repl = 0;
     g_state.n_dir++;
     return 1;
 }
@@ -367,6 +407,7 @@ int nm_state_del_dir(const char *file) {
     for (size_t i = 0; i < g_state.n_dir; ++i) {
         if (strcmp(g_state.dir[i].file, file) == 0) {
             free(g_state.dir[i].file);
+            if (g_state.dir[i].replicas) { free(g_state.dir[i].replicas); g_state.dir[i].replicas=NULL; }
             // move last into i
             if (i != g_state.n_dir - 1) g_state.dir[i] = g_state.dir[g_state.n_dir - 1];
             g_state.n_dir--;
@@ -390,6 +431,53 @@ int nm_state_rename_dir(const char *old_file, const char *new_file) {
         }
     }
     return 0;
+}
+
+// ---- Replicas ----
+static void ensure_repl_cap(struct dir_entry *e, size_t need) {
+    if (e->cap_repl >= need) return;
+    size_t nc = e->cap_repl ? e->cap_repl * 2 : 4;
+    while (nc < need) nc *= 2;
+    int *nr = (int *)realloc(e->replicas, nc * sizeof(int));
+    if (!nr) return;
+    e->replicas = nr; e->cap_repl = nc;
+}
+
+int nm_state_set_replicas(const char *file, const int *replicas, size_t n) {
+    if (!file) return -1;
+    for (size_t i=0;i<g_state.n_dir;i++) {
+        if (strcmp(g_state.dir[i].file, file)==0) {
+            struct dir_entry *e = &g_state.dir[i];
+            // Check if unchanged
+            int same = (e->n_repl == n);
+            if (same) {
+                for (size_t j=0;j<n;j++) { if (e->replicas[j] != replicas[j]) { same = 0; break; } }
+            }
+            if (same) return 0;
+            ensure_repl_cap(e, n);
+            if (e->cap_repl < n) return -1;
+            e->n_repl = n;
+            for (size_t j=0;j<n;j++) e->replicas[j] = replicas[j];
+            return 1;
+        }
+    }
+    return -1;
+}
+
+size_t nm_state_get_replicas(const char *file, int *out, size_t max) {
+    for (size_t i=0;i<g_state.n_dir;i++) {
+        if (strcmp(g_state.dir[i].file, file)==0) {
+            size_t n = g_state.dir[i].n_repl;
+            size_t c = n < max ? n : max;
+            for (size_t j=0;j<c;j++) out[j] = g_state.dir[i].replicas[j];
+            return n;
+        }
+    }
+    return 0;
+}
+
+int nm_state_get_primary(const char *file, int *out_ssid) {
+    return nm_state_find_dir(file, out_ssid);
 }
 
 // ---- ACL helpers ----
@@ -621,6 +709,124 @@ static void parse_folders_array(const char *json) {
         nm_state_add_folder(tmp);
         if (*p=='"') p++;
         while (*p && *p!=',' && *p!=']') p++;
+        if (*p==',') p++;
+    }
+}
+
+// ---- JSON parsers for replicas/requests ----
+static void parse_replicas_object(const char *json) {
+    const char *p = strstr(json, "\"replicas\"");
+    if (!p) return;
+    p = strchr(p, '{'); if (!p) return; p++;
+    while (*p) {
+        while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+        if (*p=='}') break;
+        if (*p!='"') break;
+        p++;
+        const char *kstart = p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
+        size_t klen=(size_t)(p-kstart); char file[256]; size_t j=0; const char *s=kstart; while(j<klen&&*s){ if(*s=='\\'&&s[1]){s++; file[j++]=*s++;} else file[j++]=*s++; } file[j]='\0'; if (*p=='"') p++;
+    while (*p && *p!='[') p++;
+    if (*p!='[') break;
+    p++;
+        int reps[64]; size_t nr=0;
+        while (*p && *p!=']') {
+            while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+            const char *v = p; while (*p && *p!=',' && *p!=']') p++;
+            char num[32]; size_t n=(size_t)(p-v); if (n>=sizeof(num)) n=sizeof(num)-1; memcpy(num,v,n); num[n]='\0';
+            if (nr < 64) reps[nr++] = atoi(num);
+            if (*p==',') p++;
+        }
+        if (*p==']') p++;
+        nm_state_set_replicas(file, reps, nr);
+    while (*p && *p!=',' && *p!='}') p++;
+    if (*p==',') p++;
+    }
+}
+
+static void ensure_req_cap(size_t need) {
+    if (g_state.cap_requests >= need) return;
+    size_t nc = g_state.cap_requests ? g_state.cap_requests * 2 : 8;
+    while (nc < need) nc *= 2;
+    struct req_entry *nr = (struct req_entry *)realloc(g_state.requests, nc * sizeof(*g_state.requests));
+    if (!nr) return;
+    g_state.requests = nr; g_state.cap_requests = nc;
+}
+
+static struct req_entry *find_req_entry(const char *file) {
+    for (size_t i=0;i<g_state.n_requests;i++) if (strcmp(g_state.requests[i].file, file)==0) return &g_state.requests[i];
+    return NULL;
+}
+
+int nm_state_add_request(const char *file, const char *user) {
+    if (!file || !user || !*user) return 0;
+    if (nm_state_find_dir(file, NULL) != 0) return 0; // only for known files
+    struct req_entry *e = find_req_entry(file);
+    if (!e) {
+        ensure_req_cap(g_state.n_requests + 1);
+        if (g_state.cap_requests < g_state.n_requests + 1) return 0;
+        e = &g_state.requests[g_state.n_requests++];
+        memset(e, 0, sizeof(*e));
+        e->file = strdup(file);
+    }
+    // check duplicate
+    for (size_t i=0;i<e->n_users;i++) if (strcmp(e->users[i], user)==0) return 0;
+    size_t need = e->n_users + 1;
+    if (e->cap_users < need) {
+        size_t nc = e->cap_users ? e->cap_users * 2 : 4; while (nc < need) nc *= 2;
+        char **nu = (char **)realloc(e->users, nc * sizeof(char *)); if (!nu) return 0; e->users = nu; e->cap_users = nc;
+    }
+    e->users[e->n_users] = strdup(user); if (!e->users[e->n_users]) return 0; e->n_users++;
+    return 1;
+}
+
+size_t nm_state_list_requests(const char *file, char users[][128], size_t max_users) {
+    struct req_entry *e = find_req_entry(file);
+    if (!e) return 0;
+    size_t c = e->n_users < max_users ? e->n_users : max_users;
+    for (size_t i=0;i<c;i++) snprintf(users[i], 128, "%s", e->users[i]);
+    return c;
+}
+
+int nm_state_remove_request(const char *file, const char *user) {
+    struct req_entry *e = find_req_entry(file);
+    if (!e) return 0;
+    for (size_t i=0;i<e->n_users;i++) {
+        if (strcmp(e->users[i], user)==0) {
+            free(e->users[i]);
+            if (i != e->n_users - 1) e->users[i] = e->users[e->n_users - 1];
+            e->n_users--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void parse_requests_object(const char *json) {
+    const char *p = strstr(json, "\"requests\"");
+    if (!p) return;
+    p = strchr(p, '{'); if (!p) return; p++;
+    while (*p) {
+        while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+        if (*p=='}') break;
+        if (*p!='"') break;
+        p++;
+        const char *kstart=p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
+        size_t klen=(size_t)(p-kstart); char file[256]; size_t j=0; const char *s=kstart; while(j<klen && *s){ if(*s=='\\'&&s[1]){s++; file[j++]=*s++;} else file[j++]=*s++; } file[j]='\0'; if (*p=='"') p++;
+    while (*p && *p!='[') p++;
+    if (*p!='[') break;
+    p++;
+        while (*p && *p!=']') {
+            while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+            if (*p=='"') {
+                p++; const char *ust=p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
+                size_t ulen=(size_t)(p-ust); char user[128]; size_t ui=0; const char *us=ust; while(ui<ulen&&*us){ if(*us=='\\'&&us[1]){us++; user[ui++]=*us++;} else user[ui++]=*us++; } user[ui]='\0'; if (*p=='"') p++;
+                nm_state_add_request(file, user);
+            }
+            while (*p && *p!=',' && *p!=']') p++;
+            if (*p==',') p++;
+        }
+        if (*p==']') p++;
+        while (*p && *p!=',' && *p!='}') p++;
         if (*p==',') p++;
     }
 }

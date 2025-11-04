@@ -18,6 +18,8 @@
 static volatile int g_run = 1;
 static int g_data_lfd = -1;
 static int g_ss_id = 0;
+static char g_nm_host[64] = {0};
+static uint16_t g_nm_port = 0;
 
 // Simple per-file sentence lock table (linked list)
 typedef struct lock_node {
@@ -67,6 +69,19 @@ static void ensure_dirs(void) {
     mkdir("ss_data/undo", 0755);
     mkdir("ss_data/history", 0755);
     mkdir("ss_data/checkpoints", 0755);
+}
+
+static void *heartbeat_thread(void *arg) {
+    (void)arg;
+    while (g_run) {
+        int hfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
+        if (hfd >= 0) {
+            char hb[128]; hb[0]='\0'; json_put_string_field(hb, sizeof(hb), "type", "SS_HEARTBEAT", 1); json_put_int_field(hb, sizeof(hb), "ssId", g_ss_id, 0); strncat(hb, "}", sizeof(hb)-strlen(hb)-1);
+            (void)send_msg(hfd, hb, (uint32_t)strlen(hb)); char *hr=NULL; uint32_t hrl=0; (void)recv_msg(hfd, &hr, &hrl); if (hr) free(hr); close(hfd);
+        }
+        sleep(2);
+    }
+    return NULL;
 }
 
 // Create parent directories for a given path (in-place path not modified).
@@ -347,6 +362,12 @@ static void *data_server_thread(void *arg) {
                                     fprintf(stderr, "[SS] END_WRITE commit OK\n"); fflush(stderr);
                                     free(new_text);
                                     const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                                    // Notify NM about commit for replication
+                                    int nfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
+                                    if (nfd >= 0) {
+                                        char note[256]; note[0]='\0'; json_put_string_field(note, sizeof(note), "type", "SS_COMMIT", 1); json_put_string_field(note, sizeof(note), "file", ws.file, 0); json_put_int_field(note, sizeof(note), "ssId", g_ss_id, 0); strncat(note, "}", sizeof(note)-strlen(note)-1);
+                                        (void)send_msg(nfd, note, (uint32_t)strlen(note)); char *nr=NULL; uint32_t nrl=0; (void)recv_msg(nfd, &nr, &nrl); if (nr) free(nr); close(nfd);
+                                    }
                                 }
                             }
                         }
@@ -668,6 +689,10 @@ int main(int argc, char **argv) {
 
     ensure_dirs();
 
+    // cache NM endpoint for heartbeats/commit
+    snprintf(g_nm_host, sizeof(g_nm_host), "%s", nm_host);
+    g_nm_port = nm_port;
+
     // 1) Bind the data port FIRST so we never register an unusable endpoint with NM
     int pre_lfd = tcp_listen((uint16_t)ss_data_port, 64);
     if (pre_lfd < 0) {
@@ -694,6 +719,11 @@ int main(int argc, char **argv) {
     if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); close(pre_lfd); return 1; }
     printf("[SS] NM response: %.*s\n", rlen, resp ? resp : "");
     free(resp);
+
+    // Start heartbeat thread (detached)
+    pthread_t th_hb;
+    pthread_create(&th_hb, NULL, heartbeat_thread, NULL);
+    pthread_detach(th_hb);
 
     // Start data server thread
     pthread_t th_data;

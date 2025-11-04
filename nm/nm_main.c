@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 
 #include "../common/net_proto.h"
 #include "nm_persist.h"
@@ -19,6 +20,8 @@ typedef struct ss_entry {
     int ss_id;
     int ss_ctrl_port;
     int ss_data_port;
+    time_t last_heartbeat;
+    int is_up;
     struct ss_entry *next;
 } ss_entry_t;
 
@@ -28,8 +31,132 @@ static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 static void add_ss(int id, int ctrl, int data) {
     pthread_mutex_lock(&g_mu);
     ss_entry_t *e = (ss_entry_t *)malloc(sizeof(ss_entry_t));
-    e->ss_id = id; e->ss_ctrl_port = ctrl; e->ss_data_port = data; e->next = g_ss_list; g_ss_list = e;
+    e->ss_id = id; e->ss_ctrl_port = ctrl; e->ss_data_port = data; e->last_heartbeat = time(NULL); e->is_up = 1; e->next = g_ss_list; g_ss_list = e;
     pthread_mutex_unlock(&g_mu);
+}
+
+static ss_entry_t *find_ss_nolock(int id) {
+    for (ss_entry_t *e = g_ss_list; e; e = e->next) if (e->ss_id == id) return e;
+    return NULL;
+}
+
+static int get_data_port_for(int ssid) {
+    int port = 0;
+    pthread_mutex_lock(&g_mu);
+    ss_entry_t *e = find_ss_nolock(ssid);
+    if (e) port = e->ss_data_port;
+    pthread_mutex_unlock(&g_mu);
+    return port;
+}
+
+// Replication queue metric
+static pthread_mutex_t g_rep_mu = PTHREAD_MUTEX_INITIALIZER;
+static int g_replication_queue = 0; // pending/in-flight tasks
+
+static void repq_inc(int delta) { pthread_mutex_lock(&g_rep_mu); g_replication_queue += delta; if (g_replication_queue < 0) g_replication_queue = 0; pthread_mutex_unlock(&g_rep_mu); }
+static int repq_get(void) { pthread_mutex_lock(&g_rep_mu); int v = g_replication_queue; pthread_mutex_unlock(&g_rep_mu); return v; }
+
+// Helper: fetch whole file text from a given SS (by ssid) using READ ticket
+static int fetch_file_from_ss(const char *file, int ssid, char *out_body, size_t out_sz) {
+    int data_port = get_data_port_for(ssid);
+    if (data_port == 0) return -1;
+    char ticket[256]; if (ticket_build(file, "READ", ssid, 600, ticket, sizeof(ticket)) != 0) return -1;
+    int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) return -1;
+    char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "READ", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+    if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); return -1; }
+    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) free(r); close(sfd); return -1; }
+    int ok = (json_get_string_field(r, "body", out_body, out_sz) == 0);
+    free(r); close(sfd);
+    return ok ? 0 : -1;
+}
+
+// Fire-and-forget PUT replicate to a target ssid (fetches from primary)
+typedef struct { char file[128]; int primary_ssid; int target_ssid; } repl_put_args_t;
+static void *repl_put_thread(void *arg) {
+    repl_put_args_t *a = (repl_put_args_t *)arg;
+    char body[8192]; body[0]='\0';
+    if (fetch_file_from_ss(a->file, a->primary_ssid, body, sizeof(body)) == 0) {
+        int dport = get_data_port_for(a->target_ssid);
+        if (dport) {
+            int dfd = tcp_connect("127.0.0.1", (uint16_t)dport);
+            if (dfd >= 0) {
+                char req[9216]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "PUT", 1); json_put_string_field(req, sizeof(req), "file", a->file, 0); json_put_string_field(req, sizeof(req), "body", body, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                (void)send_msg(dfd, req, (uint32_t)strlen(req)); char *rr=NULL; uint32_t rrl=0; (void)recv_msg(dfd, &rr, &rrl); if (rr) free(rr); close(dfd);
+                fprintf(stderr, "[NM] Replicated PUT %s -> ss%d\n", a->file, a->target_ssid);
+            }
+        }
+    }
+    repq_inc(-1);
+    free(a);
+    return NULL;
+}
+
+static void schedule_put_repl(const char *file, int primary_ssid, int target_ssid) {
+    repl_put_args_t *a = (repl_put_args_t *)malloc(sizeof(*a)); if (!a) return;
+    snprintf(a->file, sizeof(a->file), "%s", file); a->primary_ssid = primary_ssid; a->target_ssid = target_ssid;
+    pthread_t th; repq_inc(1); pthread_create(&th, NULL, repl_put_thread, a); pthread_detach(th);
+}
+
+// Fire-and-forget simple command replicate (CREATE/DELETE/RENAME)
+typedef struct { char type[16]; char file[128]; char newfile[128]; int target_ssid; } repl_cmd_args_t;
+static void *repl_cmd_thread(void *arg) {
+    repl_cmd_args_t *a = (repl_cmd_args_t*)arg;
+    int dport = get_data_port_for(a->target_ssid);
+    if (dport) {
+        int dfd = tcp_connect("127.0.0.1", (uint16_t)dport);
+        if (dfd >= 0) {
+            char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", a->type, 1); json_put_string_field(req, sizeof(req), "file", a->file, 0); if (strcmp(a->type, "RENAME")==0) json_put_string_field(req, sizeof(req), "newFile", a->newfile, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+            (void)send_msg(dfd, req, (uint32_t)strlen(req)); char *r=NULL; uint32_t rl=0; (void)recv_msg(dfd, &r, &rl); if (r) free(r); close(dfd);
+            fprintf(stderr, "[NM] Replicated %s %s -> ss%d\n", a->type, a->file, a->target_ssid);
+        }
+    }
+    repq_inc(-1);
+    free(a);
+    return NULL;
+}
+
+static void schedule_cmd_repl(const char *type, const char *file, const char *newfile, int target_ssid) {
+    repl_cmd_args_t *a = (repl_cmd_args_t*)malloc(sizeof(*a)); if (!a) return;
+    snprintf(a->type, sizeof(a->type), "%s", type); snprintf(a->file, sizeof(a->file), "%s", file); a->newfile[0]='\0'; if (newfile) snprintf(a->newfile, sizeof(a->newfile), "%s", newfile); a->target_ssid = target_ssid;
+    pthread_t th; repq_inc(1); pthread_create(&th, NULL, repl_cmd_thread, a); pthread_detach(th);
+}
+
+// Background thread: mark SS down if heartbeat stale and promote replicas
+static void *hb_monitor_thread(void *arg) {
+    (void)arg;
+    while (g_running) {
+        time_t now = time(NULL);
+        pthread_mutex_lock(&g_mu);
+        for (ss_entry_t *e = g_ss_list; e; e = e->next) {
+            int was_up = e->is_up;
+            if (now - e->last_heartbeat > 6) e->is_up = 0; else e->is_up = 1;
+            if (was_up && !e->is_up) {
+                fprintf(stderr, "[NM] SS %d marked DOWN\n", e->ss_id);
+            }
+        }
+        pthread_mutex_unlock(&g_mu);
+        // Promote primaries whose SS is down
+        char files[512][128]; int ssids[512]; size_t n = nm_state_get_dir(files, ssids, 512);
+        for (size_t i=0;i<n;i++) {
+            int primary = ssids[i];
+            int up = 0; pthread_mutex_lock(&g_mu); ss_entry_t *e = find_ss_nolock(primary); if (e && e->is_up) up = 1; pthread_mutex_unlock(&g_mu);
+            if (!up) {
+                int repls[16]; size_t nr = nm_state_get_replicas(files[i], repls, 16);
+                int promoted = 0;
+                for (size_t j=0;j<nr;j++) {
+                    int cand = repls[j]; int cand_up=0; pthread_mutex_lock(&g_mu); ss_entry_t *ce = find_ss_nolock(cand); if (ce && ce->is_up) cand_up=1; pthread_mutex_unlock(&g_mu);
+                    if (cand_up) { nm_dir_set(files[i], cand); // promote
+                        // adjust replicas: keep others incl old primary if it returns
+                        // simple: move promoted to front but keep list unchanged
+                        promoted = 1; fprintf(stderr, "[NM] Promoted %s primary -> ss%d\n", files[i], cand); break; }
+                }
+                if (promoted) (void)nm_state_save("nm_state.json");
+            }
+        }
+        // Sleep ~2 seconds
+        sleep(2);
+    }
+    return NULL;
 }
 
 static int pick_least_loaded_ss(int *out_ssid, int *out_data_port) {
@@ -82,6 +209,37 @@ static void *client_thread(void *arg) {
             printf("[NM] Registered SS id=%d ctrl=%d data=%d\n", ssId, ctrl, data);
             const char *resp = "{\"status\":\"OK\"}";
             send_msg(fd, resp, (uint32_t)strlen(resp));
+        } else if (strcmp(type, "SS_HEARTBEAT") == 0) {
+            int ssId=0; json_get_int_field(buf, "ssId", &ssId);
+            pthread_mutex_lock(&g_mu);
+            ss_entry_t *e = find_ss_nolock(ssId);
+            if (!e) {
+                // Unknown server; add with unknown ports
+                e = (ss_entry_t *)malloc(sizeof(ss_entry_t)); memset(e,0,sizeof(*e)); e->ss_id=ssId; e->ss_ctrl_port=0; e->ss_data_port=0; e->next=g_ss_list; g_ss_list=e;
+            }
+            int was_up = e->is_up;
+            e->last_heartbeat = time(NULL); e->is_up = 1;
+            pthread_mutex_unlock(&g_mu);
+            if (!was_up) {
+                fprintf(stderr, "[NM] SS %d transitioned UP\n", ssId);
+                // Resync files where this SS is a replica
+                char files[512][128]; int ps[512]; size_t n = nm_state_get_dir(files, ps, 512);
+                for (size_t i=0;i<n;i++) {
+                    int repls[16]; size_t nr = nm_state_get_replicas(files[i], repls, 16);
+                    for (size_t j=0;j<nr;j++) if (repls[j]==ssId) { schedule_put_repl(files[i], ps[i], ssId); }
+                }
+            }
+            const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
+        } else if (strcmp(type, "SS_COMMIT") == 0) {
+            char file[128]; int ssId=0; int okf=(json_get_string_field(buf, "file", file, sizeof(file))==0); json_get_int_field(buf, "ssId", &ssId);
+            if (!okf || ssId==0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                int primary=0; if (nm_state_find_dir(file, &primary)==0 && primary==ssId) {
+                    int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                    for (size_t i=0;i<nr;i++) schedule_put_repl(file, primary, repls[i]);
+                }
+                const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+            }
     } else if (strcmp(type, "LOOKUP") == 0) {
             // LOOKUP for READ/WRITE: {op:"READ"|"WRITE", file:"..."}
             char op[32]; char file[128]; char user[128]; user[0]='\0';
@@ -119,6 +277,12 @@ static void *client_thread(void *arg) {
                                             nm_dir_set(file, chosen_ssid);
                                             nm_acl_set_owner(file, user);
                                             nm_acl_grant(file, user, ACL_R|ACL_W);
+                                            // choose a replica if any other SS available
+                                            int repls[4]; size_t nr=0;
+                                            pthread_mutex_lock(&g_mu);
+                                            for (ss_entry_t *se=g_ss_list; se; se=se->next) if (se->ss_id != chosen_ssid) { if (nr < 4) repls[nr++] = se->ss_id; }
+                                            pthread_mutex_unlock(&g_mu);
+                                            if (nr>0) nm_state_set_replicas(file, repls, 1); // at least one replica
                                             ssid = chosen_ssid;
                                             fprintf(stderr, "[NM] mapping set %s -> ssId=%d\n", file, ssid);
                                         }
@@ -147,11 +311,17 @@ static void *client_thread(void *arg) {
                         send_msg(fd, resp, (uint32_t)strlen(resp));
                     }
                 } else {
-                    // find ss entry
+                    // find ss entry, with failover if primary down
+                    int data_port = 0; int target_ssid = ssid;
                     pthread_mutex_lock(&g_mu);
-                    ss_entry_t *e = g_ss_list; int data_port = 0;
-                    while (e) { if (e->ss_id == ssid) { data_port = e->ss_data_port; break; } e = e->next; }
+                    ss_entry_t *e = g_ss_list; while (e) { if (e->ss_id == ssid) { if (e->is_up) data_port = e->ss_data_port; break; } e = e->next; }
                     pthread_mutex_unlock(&g_mu);
+                    if (data_port == 0) {
+                        // try replicas
+                        int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                        for (size_t i=0;i<nr;i++) { int rp = get_data_port_for(repls[i]); int up=0; pthread_mutex_lock(&g_mu); ss_entry_t *re = find_ss_nolock(repls[i]); if (re && re->is_up) { up=1; } pthread_mutex_unlock(&g_mu); if (up && rp) { data_port = rp; target_ssid = repls[i]; break; } }
+                        if (data_port && target_ssid != ssid) { nm_dir_set(file, target_ssid); (void)nm_state_save("nm_state.json"); fprintf(stderr, "[NM] LOOKUP failover: promoted ssId=%d for %s\n", target_ssid, file); }
+                    }
                     if (data_port == 0) {
                         const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}";
                         send_msg(fd, resp, (uint32_t)strlen(resp));
@@ -161,11 +331,11 @@ static void *client_thread(void *arg) {
                             const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                         } else {
                         char ticket[256];
-                        if (ticket_build(file, op, ssid, 600, ticket, sizeof(ticket)) != 0) {
+                        if (ticket_build(file, op, target_ssid, 600, ticket, sizeof(ticket)) != 0) {
                             const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                         } else {
                             char resp[512];
-                            fprintf(stderr, "[NM] LOOKUP mapped file=%s ssId=%d data_port=%d\n", file, ssid, data_port);
+                            fprintf(stderr, "[NM] LOOKUP mapped file=%s ssId=%d data_port=%d\n", file, target_ssid, data_port);
                             snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"ssAddr\":\"127.0.0.1\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", data_port, ticket);
                             send_msg(fd, resp, (uint32_t)strlen(resp));
                         }
@@ -196,7 +366,11 @@ static void *client_thread(void *arg) {
                             strncat(req, "}", sizeof(req) - strlen(req) - 1);
                             if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
                                 char *r = NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) == 0 && r) {
-                                    if (strstr(r, "\"status\":\"OK\"")) { nm_dir_set(file, ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W); const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
+                                    if (strstr(r, "\"status\":\"OK\"")) { nm_dir_set(file, ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
+                                        // choose a replica and replicate CREATE asynchronously
+                                        int repls[4]; size_t nr=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *se=g_ss_list; se; se=se->next){ if (se->ss_id!=ssid && nr<4) repls[nr++]=se->ss_id; } pthread_mutex_unlock(&g_mu);
+                                        if (nr>0) { nm_state_set_replicas(file, repls, 1); schedule_cmd_repl("CREATE", file, NULL, repls[0]); }
+                                        const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
                                     else if (strstr(r, "ERR_CONFLICT")) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                     else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                 } else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -241,6 +415,9 @@ static void *client_thread(void *arg) {
                                     if (recv_msg(sfd, &r, &rl) == 0 && r) {
                                         if (strstr(r, "\"status\":\"OK\"")) {
                                             nm_dir_del(file);
+                                            // replicate delete to replicas
+                                            int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                                            for (size_t i=0;i<nr;i++) schedule_cmd_repl("DELETE", file, NULL, repls[i]);
                                             const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                         } else if (strstr(r, "ERR_NOTFOUND")) {
                                             const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er));
@@ -401,6 +578,9 @@ static void *client_thread(void *arg) {
                                             if (strstr(r, "\"status\":\"OK\"")) {
                                                 nm_dir_rename(file, nfile);
                                                 nm_acl_rename(file, nfile);
+                                                // replicate rename to replicas
+                                                int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                                                for (size_t i=0;i<nr;i++) schedule_cmd_repl("RENAME", file, nfile, repls[i]);
                                                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                             } else if (strstr(r, "ERR_CONFLICT")) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                             else if (strstr(r, "ERR_NOTFOUND")) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -587,6 +767,49 @@ static void *client_thread(void *arg) {
             }
             if (w < sizeof(resp)) w += snprintf(resp + w, sizeof(resp) - w, "]}");
             send_msg(fd, resp, (uint32_t)strlen(resp));
+        } else if (strcmp(type, "REQUEST_ACCESS") == 0) {
+            char file[128]; char user[128]; if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", user, sizeof(user))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                if (nm_state_find_dir(file, NULL) != 0) { const char *er="{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    // Try add; if already exists, return ERR_CONFLICT as closest existing code
+                    int added = nm_state_add_request(file, user);
+                    if (added) { const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
+                    else { const char *er="{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                }
+            }
+        } else if (strcmp(type, "VIEWREQUESTS") == 0) {
+            char file[128]; char user[128]; if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", user, sizeof(user))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                char owner[128]; if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    char users[256][128]; size_t n = nm_state_list_requests(file, users, 256);
+                    char resp[4096]; size_t w=0; w+=snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"requests\":[");
+                    for (size_t i=0;i<n;i++){ if (i) w+=snprintf(resp+w, sizeof(resp)-w, ","); w+=snprintf(resp+w, sizeof(resp)-w, "\"%s\"", users[i]); }
+                    if (w < sizeof(resp)) w+=snprintf(resp+w, sizeof(resp)-w, "]}");
+                    send_msg(fd, resp, (uint32_t)strlen(resp));
+                }
+            }
+        } else if (strcmp(type, "APPROVE_ACCESS") == 0) {
+            char file[128]; char owner[128]; char target[128]; char mode[8]; owner[0]=mode[0]=0;
+            if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", owner, sizeof(owner))!=0 || json_get_string_field(buf, "target", target, sizeof(target))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                char ow[128]; if (nm_acl_get_owner(file, ow, sizeof(ow))!=0 || strcmp(ow, owner)!=0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    (void)json_get_string_field(buf, "mode", mode, sizeof(mode)); int perm = (strcmp(mode, "W")==0? (ACL_R|ACL_W) : (strcmp(mode, "RW")==0? (ACL_R|ACL_W) : ACL_R));
+                    nm_acl_grant(file, target, perm); nm_state_remove_request(file, target);
+                    const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+                }
+            }
+        } else if (strcmp(type, "DENY_ACCESS") == 0) {
+            char file[128]; char owner[128]; char target[128]; if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", owner, sizeof(owner))!=0 || json_get_string_field(buf, "target", target, sizeof(target))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else { char ow[128]; if (nm_acl_get_owner(file, ow, sizeof(ow))!=0 || strcmp(ow, owner)!=0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } else { nm_state_remove_request(file, target); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); } }
+        } else if (strcmp(type, "STATS") == 0) {
+            // Count mapped files accurately by requesting a large snapshot
+            char f2[1024][128]; int s2[1024]; size_t nf = nm_state_get_dir(f2, s2, 1024);
+            int q = repq_get(); int locks = -1;
+            char resp[256]; snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"files\":%zu,\"activeLocks\":%d,\"replicationQueue\":%d}", nf, locks, q);
+            send_msg(fd, resp, (uint32_t)strlen(resp));
         } else if (strcmp(type, "VIEW") == 0) {
             // flags: -a (all), -l (details). Default: only files user can READ.
             char flags[32]; flags[0]='\0'; char user[128]; user[0]='\0';
@@ -769,6 +992,9 @@ int main(int argc, char **argv) {
     int lfd = tcp_listen(port, BACKLOG);
     if (lfd < 0) { perror("listen"); return 1; }
     printf("[NM] Listening on port %u\n", (unsigned)port);
+
+    // Start heartbeat monitor
+    pthread_t th_hb; pthread_create(&th_hb, NULL, hb_monitor_thread, NULL); pthread_detach(th_hb);
 
     while (g_running) {
         struct sockaddr_in cli; socklen_t clilen = sizeof(cli);
