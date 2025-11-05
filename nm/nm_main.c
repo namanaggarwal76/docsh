@@ -145,10 +145,21 @@ static void *hb_monitor_thread(void *arg) {
                 int promoted = 0;
                 for (size_t j=0;j<nr;j++) {
                     int cand = repls[j]; int cand_up=0; pthread_mutex_lock(&g_mu); ss_entry_t *ce = find_ss_nolock(cand); if (ce && ce->is_up) cand_up=1; pthread_mutex_unlock(&g_mu);
-                    if (cand_up) { nm_dir_set(files[i], cand); // promote
-                        // adjust replicas: keep others incl old primary if it returns
-                        // simple: move promoted to front but keep list unchanged
-                        promoted = 1; fprintf(stderr, "[NM] Promoted %s primary -> ss%d\n", files[i], cand); break; }
+                    if (cand_up) {
+                        // Promote candidate and ensure old primary becomes a replica
+                        nm_dir_set(files[i], cand);
+                        int new_reps[16]; size_t nnr = 0;
+                        // Include old primary as replica
+                        new_reps[nnr++] = primary;
+                        // Keep other replicas except the new primary and duplicates
+                        for (size_t k=0;k<nr && nnr<16;k++) {
+                            if (repls[k] == cand || repls[k] == primary) continue;
+                            new_reps[nnr++] = repls[k];
+                        }
+                        nm_state_set_replicas(files[i], new_reps, nnr);
+                        promoted = 1; fprintf(stderr, "[NM] Promoted %s primary -> ss%d; old primary %d set as replica\n", files[i], cand, primary);
+                        break;
+                    }
                 }
                 if (promoted) (void)nm_state_save("nm_state.json");
             }
@@ -321,7 +332,22 @@ static void *client_thread(void *arg) {
                         // try replicas
                         int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
                         for (size_t i=0;i<nr;i++) { int rp = get_data_port_for(repls[i]); int up=0; pthread_mutex_lock(&g_mu); ss_entry_t *re = find_ss_nolock(repls[i]); if (re && re->is_up) { up=1; } pthread_mutex_unlock(&g_mu); if (up && rp) { data_port = rp; target_ssid = repls[i]; break; } }
-                        if (data_port && target_ssid != ssid) { nm_dir_set(file, target_ssid); (void)nm_state_save("nm_state.json"); fprintf(stderr, "[NM] LOOKUP failover: promoted ssId=%d for %s\n", target_ssid, file); }
+                        if (data_port && target_ssid != ssid) {
+                            // Promote to replica target_ssid and ensure old primary becomes a replica
+                            nm_dir_set(file, target_ssid);
+                            // Build new replicas: include old primary, drop the new primary if present
+                            int new_reps[16]; size_t nnr = 0;
+                            // Always include old primary as first replica
+                            new_reps[nnr++] = ssid;
+                            // Keep other replicas except the new primary and duplicates
+                            for (size_t i=0;i<nr && nnr<16;i++) {
+                                if (repls[i] == target_ssid || repls[i] == ssid) continue;
+                                new_reps[nnr++] = repls[i];
+                            }
+                            nm_state_set_replicas(file, new_reps, nnr);
+                            (void)nm_state_save("nm_state.json");
+                            fprintf(stderr, "[NM] LOOKUP failover: promoted ssId=%d for %s; old primary %d set as replica\n", target_ssid, file, ssid);
+                        }
                     }
                     if (data_port == 0) {
                         const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}";

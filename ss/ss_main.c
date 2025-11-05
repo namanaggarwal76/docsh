@@ -15,11 +15,14 @@
 #include "ss_tokenize.h"
 #include "../common/tickets.h"
 
+#define SS_PATH_MAX 1024
+
 static volatile int g_run = 1;
 static int g_data_lfd = -1;
 static int g_ss_id = 0;
 static char g_nm_host[64] = {0};
 static uint16_t g_nm_port = 0;
+static char g_store_root[512] = "ss_data"; // base per-SS store under project dir
 
 // Simple per-file sentence lock table (linked list)
 typedef struct lock_node {
@@ -62,13 +65,17 @@ static void lock_release(const char *file, int sidx) {
 static void on_sigint(int sig){ (void)sig; g_run = 0; }
 
 static void ensure_dirs(void) {
-    // Create ss_data and subfolders if missing
+    // Create per-SS store root and subfolders if missing
+    // Ensure project-level ss_data root exists
     mkdir("ss_data", 0755);
-    mkdir("ss_data/files", 0755);
-    mkdir("ss_data/meta", 0755);
-    mkdir("ss_data/undo", 0755);
-    mkdir("ss_data/history", 0755);
-    mkdir("ss_data/checkpoints", 0755);
+    // Ensure per-SS root and subdirs
+    mkdir(g_store_root, 0755);
+    char p[1024];
+    snprintf(p, sizeof(p), "%s/files", g_store_root); mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/meta", g_store_root); mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/undo", g_store_root); mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/history", g_store_root); mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/checkpoints", g_store_root); mkdir(p, 0755);
 }
 
 static void *heartbeat_thread(void *arg) {
@@ -87,13 +94,13 @@ static void *heartbeat_thread(void *arg) {
 // Create parent directories for a given path (in-place path not modified).
 static void ensure_parent_dirs_for(const char *path) {
     if (!path) return;
-    char tmp[512]; snprintf(tmp, sizeof(tmp), "%s", path);
+    char tmp[SS_PATH_MAX]; snprintf(tmp, sizeof(tmp), "%s", path);
     // Find last slash
     char *p = strrchr(tmp, '/');
     if (!p) return; // no parent dirs
     *p = '\0';
     // Recursively create
-    char buf[512]; buf[0] = '\0';
+    char buf[SS_PATH_MAX]; buf[0] = '\0';
     const char *s = tmp;
     if (*s == '\0') return;
     // Handle absolute-like paths won't occur; start from beginning
@@ -104,7 +111,7 @@ static void ensure_parent_dirs_for(const char *path) {
         if (strlen(buf) + seglen + 2 >= sizeof(buf)) break;
         if (buf[0]) strncat(buf, "/", sizeof(buf) - strlen(buf) - 1);
         strncat(buf, s, seglen);
-        char dirpath[512]; snprintf(dirpath, sizeof(dirpath), "%s", buf);
+        char dirpath[SS_PATH_MAX]; snprintf(dirpath, sizeof(dirpath), "%s", buf);
         mkdir(dirpath, 0755);
         if (!slash) break;
         s = slash + 1;
@@ -148,8 +155,8 @@ typedef struct conn_write_session {
 
 // Helpers for M9 history
 static int history_next_index(const char *file) {
-    // Scan ss_data/history for files named "<file>.<num>.snap" and return max(num)+1
-    char dpath[256]; snprintf(dpath, sizeof(dpath), "ss_data/history");
+    // Scan history dir for files named "<file>.<num>.snap" and return max(num)+1
+    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
     int next = 1;
     DIR *d = opendir(dpath);
     if (!d) return next;
@@ -173,7 +180,7 @@ static int history_next_index(const char *file) {
 static void history_save_snapshot(const char *file, const void *data, size_t len) {
     if (!file) return;
     int idx = history_next_index(file);
-    char hpath[512]; snprintf(hpath, sizeof(hpath), "ss_data/history/%s.%d.snap", file, idx);
+    char hpath[SS_PATH_MAX]; snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, idx);
     FILE *hf = fopen(hpath, "wb");
     if (!hf) { perror("[SS] history fopen"); return; }
     if (data && len > 0) fwrite(data, 1, len, hf);
@@ -214,7 +221,7 @@ static void *data_server_thread(void *arg) {
                     } else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) {
                         const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                     } else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         char *content = NULL; size_t clen = 0;
                         if (read_file_into(path, &content, &clen) == 0) {
                             char resp[8192]; resp[0] = '\0';
@@ -231,7 +238,7 @@ static void *data_server_thread(void *arg) {
                 } else if (strcmp(type, "CREATE") == 0) {
                     char file[128];
                     if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         ensure_parent_dirs_for(path);
                         fprintf(stderr, "[SS] CREATE file=%s path=%s\n", file, path); fflush(stderr);
                         FILE *test = fopen(path, "rb");
@@ -245,7 +252,7 @@ static void *data_server_thread(void *arg) {
                 } else if (strcmp(type, "DELETE") == 0) {
                     char file[128];
                     if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         fprintf(stderr, "[SS] DELETE file=%s path=%s\n", file, path); fflush(stderr);
                         if (unlink(path) == 0) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
@@ -264,7 +271,7 @@ static void *data_server_thread(void *arg) {
                         fprintf(stderr, "[SS] lock_acquire rc=%d\n", lrc); fflush(stderr);
                         if (lrc != 0) { const char *resp = "{\"status\":\"ERR_LOCKED\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
-                            char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                            char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                             char *content = NULL; size_t clen = 0;
                             int rfirc = read_file_into(path, &content, &clen);
                             fprintf(stderr, "[SS] read_file_into rc=%d path=%s\n", rfirc, path); fflush(stderr);
@@ -336,13 +343,19 @@ static void *data_server_thread(void *arg) {
                         fprintf(stderr, "[SS] END_WRITE composing: %s\n", new_text?new_text:"(null)"); fflush(stderr);
                         if (!new_text) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
-                            char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", ws.file);
+                            char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, ws.file);
                             // Before committing, save a one-level undo snapshot of the pre-commit content captured at BEGIN_WRITE
-                            char undopath[512]; snprintf(undopath, sizeof(undopath), "ss_data/undo/%s.undo", ws.file);
-                            char tmppath[512];
+                            char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, ws.file);
+                            char tmppath[SS_PATH_MAX];
                             size_t pl = strlen(path);
-                            if (pl + 4 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
-                            else snprintf(tmppath, sizeof(tmppath), "ss_data/meta/commit.tmp");
+                            if (pl + 4 + 1 <= sizeof(tmppath)) {
+                                snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+                            } else {
+                                char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root);
+                                mkdir(mp, 0755);
+                                snprintf(tmppath, sizeof(tmppath), "%s", mp);
+                                strncat(tmppath, "/commit.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
+                            }
                             fprintf(stderr, "[SS] END_WRITE write temp=%s final=%s\n", tmppath, path); fflush(stderr);
                             FILE *f = fopen(tmppath, "wb");
                             if (!f) { free(new_text); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
@@ -385,18 +398,26 @@ static void *data_server_thread(void *arg) {
                     } else if (ticket_validate(ticket, file, "UNDO", g_ss_id) != 0) {
                         const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                     } else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
-                        char undopath[512]; snprintf(undopath, sizeof(undopath), "ss_data/undo/%s.undo", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                        char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, file);
                         // Load undo snapshot
                         char *undo_content = NULL; size_t ulen = 0;
                         if (read_file_into(undopath, &undo_content, &ulen) != 0) {
                             const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                         } else {
                             // Write undo content to a temp and atomically replace
-                            char tmppath[512];
+                            char tmppath[SS_PATH_MAX];
                             size_t pl = strlen(path);
-                            if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.udtmp", path);
-                            else snprintf(tmppath, sizeof(tmppath), "ss_data/meta/undo.tmp");
+                            if (pl + 6 + 1 <= sizeof(tmppath)) {
+                                snprintf(tmppath, sizeof(tmppath), "%s.udtmp", path);
+                            } else {
+                                char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root);
+                                mkdir(mp, 0755);
+                                snprintf(tmppath, sizeof(tmppath), "%s", mp);
+                                strncat(tmppath, "/undo.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
+                            }
+                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                             FILE *f = fopen(tmppath, "wb");
                             if (!f) { free(undo_content); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                             else {
@@ -420,7 +441,7 @@ static void *data_server_thread(void *arg) {
                     else if (ticket_validate(ticket, file, "HISTORY", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
                         // Build versions list
-                        char dpath[256]; snprintf(dpath, sizeof(dpath), "ss_data/history");
+                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
                         DIR *d = opendir(dpath);
                         char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"versions\":[");
                         if (d) {
@@ -449,18 +470,18 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt || ((ver<=0) && !cname[0])) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "REVERT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         // Save pre-revert into history
                         char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen)==0) { history_save_snapshot(file, cur, clen); free(cur);} 
                         // Load snapshot to revert to (by version or checkpoint name)
-                        char hpath[512];
-                        if (cname[0]) snprintf(hpath, sizeof(hpath), "ss_data/checkpoints/%s/%s.chk", file, cname);
-                        else snprintf(hpath, sizeof(hpath), "ss_data/history/%s.%d.snap", file, ver);
+                        char hpath[SS_PATH_MAX];
+                        if (cname[0]) snprintf(hpath, sizeof(hpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, cname);
+                        else snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, ver);
                         char *snap=NULL; size_t slen=0;
                         if (read_file_into(hpath, &snap, &slen) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
-                            char tmppath[512]; size_t pl=strlen(path);
-                            if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.rvtmp", path); else snprintf(tmppath, sizeof(tmppath), "ss_data/meta/revert.tmp");
+                            char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
+                            if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.rvtmp", path); else { char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755); snprintf(tmppath, sizeof(tmppath), "%s", mp); strncat(tmppath, "/revert.tmp", sizeof(tmppath)-strlen(tmppath)-1);} 
                             FILE *f = fopen(tmppath, "wb"); if (!f) { free(snap); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                             else { fwrite(snap, 1, slen, f); fflush(f); fclose(f); free(snap); if (rename(tmppath, path)!=0) { perror("[SS] revert rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } }
                         }
@@ -473,10 +494,10 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt || !okn || !name[0]) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "CHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
                         else {
-                            char cpath[512]; snprintf(cpath, sizeof(cpath), "ss_data/checkpoints/%s/%s.chk", file, name);
+                            char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
                             ensure_parent_dirs_for(cpath);
                             FILE *f = fopen(cpath, "wb"); if (!f) { free(cur); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
                             else { fwrite(cur, 1, clen, f); fflush(f); fclose(f); free(cur); const char *ok="{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
@@ -489,7 +510,7 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "LISTCHECKPOINTS", g_ss_id) != 0 && ticket_validate(ticket, file, "VIEWCHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char dpath[512]; snprintf(dpath, sizeof(dpath), "ss_data/checkpoints/%s", file);
+                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/checkpoints/%s", g_store_root, file);
                         DIR *d = opendir(dpath);
                         char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"checkpoints\":[");
                         int first=1; if (d) {
@@ -516,7 +537,7 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt || !okn) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "VIEWCHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char cpath[512]; snprintf(cpath, sizeof(cpath), "ss_data/checkpoints/%s/%s.chk", file, name);
+                        char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
                         char *content=NULL; size_t clen=0; if (read_file_into(cpath, &content, &clen) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
                         else {
                             char resp[8192]; resp[0]='\0';
@@ -533,29 +554,29 @@ static void *data_server_thread(void *arg) {
                     int okn = (json_get_string_field(buf, "newFile", nfile, sizeof(nfile)) == 0);
                     if (!okf || !okn) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char path_old[512]; snprintf(path_old, sizeof(path_old), "ss_data/files/%s", file);
-                        char path_new[512]; snprintf(path_new, sizeof(path_new), "ss_data/files/%s", nfile);
+                        char path_old[SS_PATH_MAX]; snprintf(path_old, sizeof(path_old), "%s/files/%s", g_store_root, file);
+                        char path_new[SS_PATH_MAX]; snprintf(path_new, sizeof(path_new), "%s/files/%s", g_store_root, nfile);
                         // Conflicts
                         struct stat st;
                         if (stat(path_old, &st) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else if (stat(path_new, &st) == 0) { const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
                             // Rename undo snapshot if present
-                            char u_old[512]; snprintf(u_old, sizeof(u_old), "ss_data/undo/%s.undo", file);
-                            char u_new[512]; snprintf(u_new, sizeof(u_new), "ss_data/undo/%s.undo", nfile);
+                            char u_old[SS_PATH_MAX]; snprintf(u_old, sizeof(u_old), "%s/undo/%s.undo", g_store_root, file);
+                            char u_new[SS_PATH_MAX]; snprintf(u_new, sizeof(u_new), "%s/undo/%s.undo", g_store_root, nfile);
                             ensure_parent_dirs_for(u_new);
                             if (stat(u_old, &st) == 0) { (void)rename(u_old, u_new); }
                             // Rename history snapshots
-                            char dpath[256]; snprintf(dpath, sizeof(dpath), "ss_data/history");
+                            char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
                             DIR *d = opendir(dpath);
                             if (d) {
                                 size_t flen = strlen(file); struct dirent *de;
                                 while ((de = readdir(d)) != NULL) {
                                     const char *name = de->d_name;
                                     if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                        char src[512]; char dst[512];
-                                        snprintf(src, sizeof(src), "ss_data/history/%s", name);
-                                        snprintf(dst, sizeof(dst), "ss_data/history/%s%s", nfile, name + flen);
+                                        char src[SS_PATH_MAX]; char dst[SS_PATH_MAX];
+                                        snprintf(src, sizeof(src), "%s/history/%s", g_store_root, name);
+                                        snprintf(dst, sizeof(dst), "%s/history/%s%s", g_store_root, nfile, name + flen);
                                         ensure_parent_dirs_for(dst);
                                         (void)rename(src, dst);
                                     }
@@ -575,10 +596,16 @@ static void *data_server_thread(void *arg) {
                     int okb = (json_get_string_field(buf, "body", body, sizeof(body)) == 0);
                     if (!okf || !okb) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         // Write to temp then rename
-                        char tmppath[512]; size_t pl=strlen(path);
-                        if (pl + 5 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.ptmp", path); else snprintf(tmppath, sizeof(tmppath), "ss_data/meta/put.tmp");
+                        char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
+                        if (pl + 5 + 1 <= sizeof(tmppath)) {
+                            snprintf(tmppath, sizeof(tmppath), "%s.ptmp", path);
+                        } else {
+                            char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755);
+                            snprintf(tmppath, sizeof(tmppath), "%s", mp);
+                            strncat(tmppath, "/put.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
+                        }
                         fprintf(stderr, "[SS] PUT writing tmppath=%s final=%s len=%zu\n", tmppath, path, strlen(body)); fflush(stderr);
                         ensure_parent_dirs_for(path);
                         FILE *f = fopen(tmppath, "wb");
@@ -604,7 +631,7 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         struct stat st;
                         if (stat(path, &st) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
@@ -630,7 +657,7 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        char path[512]; snprintf(path, sizeof(path), "ss_data/files/%s", file);
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         char *content=NULL; size_t clen=0;
                         if (read_file_into(path, &content, &clen) != 0 || !content) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
@@ -683,6 +710,9 @@ int main(int argc, char **argv) {
     int ss_data_port = atoi(argv[4]);
     int ss_id = argc >= 6 ? atoi(argv[5]) : ss_ctrl_port; // default id
     g_ss_id = ss_id;
+
+    // Set per-SS data root inside project dir: ss_data/ss<id>
+    snprintf(g_store_root, sizeof(g_store_root), "ss_data/ss%d", g_ss_id);
 
     signal(SIGINT, on_sigint);
     signal(SIGTERM, on_sigint);
