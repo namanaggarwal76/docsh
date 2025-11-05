@@ -208,8 +208,15 @@ READ wowee.txt
 3) Create a file
 
 ```
+# Private by default (owner RW only)
 CREATE mouse.txt
 VIEW
+
+# Public read at creation
+CREATE public.txt -r
+
+# Public write at creation (implies read)
+CREATE scratch.txt -w
 ```
 
 4) Write to a file (interactive, sentence locking)
@@ -287,6 +294,15 @@ VIEWREQUESTS file.txt
 APPROVE_ACCESS file.txt -R user2
 DENY_ACCESS file.txt user2
 ```
+
+Default visibility and CREATE flags:
+
+- Files are private by default: only the owner has RW.
+- You can make files public at creation time using flags:
+	- `-r` grants READ to `anonymous` (all users).
+	- `-w` grants WRITE (and READ) to `anonymous`.
+	- You can combine them; `-w` implies read.
+	- Example: `CREATE notes.txt -r` or `CREATE scratch.txt -w`.
 
 11) Execute file (runs on NM and returns output)
 
