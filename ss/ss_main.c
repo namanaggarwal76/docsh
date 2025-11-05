@@ -254,7 +254,38 @@ static void *data_server_thread(void *arg) {
                     if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
                         char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         fprintf(stderr, "[SS] DELETE file=%s path=%s\n", file, path); fflush(stderr);
-                        if (unlink(path) == 0) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        int ok = (unlink(path) == 0);
+                        // Best-effort: remove undo snapshot
+                        char undopath[512]; snprintf(undopath, sizeof(undopath), "ss_data/undo/%s.undo", file);
+                        (void)unlink(undopath);
+                        // Remove checkpoints folder for file
+                        char chkdir[512]; snprintf(chkdir, sizeof(chkdir), "ss_data/checkpoints/%s", file);
+                        DIR *cd = opendir(chkdir);
+                        if (cd) {
+                            struct dirent *de; char entry[512];
+                            while ((de = readdir(cd)) != NULL) {
+                                if (strcmp(de->d_name, ".")==0 || strcmp(de->d_name, "..")==0) continue;
+                                snprintf(entry, sizeof(entry), "ss_data/checkpoints/%s/%s", file, de->d_name);
+                                (void)unlink(entry);
+                            }
+                            closedir(cd);
+                            (void)rmdir(chkdir);
+                        }
+                        // Remove history snapshots for file
+                        char hdir[256]; snprintf(hdir, sizeof(hdir), "ss_data/history");
+                        DIR *hd = opendir(hdir);
+                        if (hd) {
+                            size_t flen = strlen(file); struct dirent *de;
+                            while ((de = readdir(hd)) != NULL) {
+                                const char *name = de->d_name;
+                                if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
+                                    char hp[512]; snprintf(hp, sizeof(hp), "ss_data/history/%s", name);
+                                    (void)unlink(hp);
+                                }
+                            }
+                            closedir(hd);
+                        }
+                        if (ok) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     } else { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                 } else if (strcmp(type, "BEGIN_WRITE") == 0) {
@@ -307,7 +338,18 @@ static void *data_server_thread(void *arg) {
                                         doc.word_counts = (int *)calloc(1, sizeof(int));
                                         if (!doc.sent_words || !doc.word_counts) { ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                                     }
-                                    if (sidx < 0 || sidx >= doc.num_sentences) { fprintf(stderr, "[SS] sidx out of range: sidx=%d num_sentences=%d\n", sidx, doc.num_sentences); ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                                    if (sidx < 0 || sidx > doc.num_sentences) { fprintf(stderr, "[SS] sidx out of range: sidx=%d num_sentences=%d\n", sidx, doc.num_sentences); ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                                    else if (sidx == doc.num_sentences) {
+                                        // Allow appending a new empty sentence
+                                        int ns = doc.num_sentences + 1;
+                                        char ***sw = (char ***)realloc(doc.sent_words, (size_t)ns * sizeof(char **));
+                                        int *wcarr = (int *)realloc(doc.word_counts, (size_t)ns * sizeof(int));
+                                        if (!sw || !wcarr) { ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                                        else {
+                                            doc.sent_words = sw; doc.word_counts = wcarr; doc.num_sentences = ns;
+                                            doc.sent_words[ns-1] = NULL; doc.word_counts[ns-1] = 0;
+                                        }
+                                    }
                                     else {
                                         ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
                                         fprintf(stderr, "[SS] BEGIN_WRITE session started, sidx=%d\n", sidx); fflush(stderr);
@@ -325,11 +367,11 @@ static void *data_server_thread(void *arg) {
                         int okw = (json_get_int_field(buf, "wordIndex", &widx) == 0);
                         int okc = (json_get_string_field(buf, "content", content, sizeof(content)) == 0);
                         fprintf(stderr, "[SS] APPLY okw=%d okc=%d widx=%d content=%s\n", okw, okc, widx, okc?content:"?"); fflush(stderr);
-                        if (!okw || !okc) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        if (!okw || !okc) { const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"missing-fields\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
                             if (ss_tokens_replace_or_append(&ws.doc, ws.sentence_idx, widx, content) != 0) {
                                 fprintf(stderr, "[SS] APPLY failed (indices)\n"); fflush(stderr);
-                                const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                                const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"invalid-index-or-content\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                             } else {
                                 fprintf(stderr, "[SS] APPLY OK\n"); fflush(stderr);
                                 const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));

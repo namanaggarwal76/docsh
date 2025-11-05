@@ -91,6 +91,15 @@ size_t nm_state_get_users(char users[][128], size_t max_users) {
     return c;
 }
 
+size_t nm_state_get_active_users(char users[][128], size_t max_users) {
+    size_t c = 0;
+    for (size_t i = 0; i < g_state.n_active && c < max_users; ++i) {
+        snprintf(users[c], 128, "%s", g_state.active_users[i]);
+        c++;
+    }
+    return c;
+}
+
 int nm_state_user_is_active(const char *user) {
     if (!user || !*user) return 0;
     for (size_t i = 0; i < g_state.n_active; ++i) {
@@ -624,6 +633,24 @@ int nm_acl_revoke(const char *file, const char *user) {
     return 0;
 }
 
+int nm_acl_delete(const char *file) {
+    if (!file || !*file) return 0;
+    for (size_t i=0;i<g_state.n_acls;i++) {
+        if (strcmp(g_state.acls[i].file, file)==0) {
+            struct acl_entry *e = &g_state.acls[i];
+            if (e->owner) { free(e->owner); e->owner=NULL; }
+            for (size_t j=0;j<e->n_grants;j++) if (e->grants[j].user) free(e->grants[j].user);
+            if (e->grants) { free(e->grants); e->grants=NULL; }
+            if (e->file) { free(e->file); e->file=NULL; }
+            // swap with last
+            if (i != g_state.n_acls-1) g_state.acls[i] = g_state.acls[g_state.n_acls-1];
+            g_state.n_acls--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 int nm_acl_check(const char *file, const char *user, const char *op) {
     if (!file || !user || !op) return -1;
     struct acl_entry *e = find_acl(file);
@@ -880,6 +907,18 @@ int nm_state_remove_request(const char *file, const char *user) {
         }
     }
     return 0;
+}
+
+int nm_state_clear_requests_for(const char *file) {
+    struct req_entry *e = find_req_entry(file);
+    if (!e) return 0;
+    for (size_t i=0;i<e->n_users;i++) if (e->users[i]) free(e->users[i]);
+    free(e->users); e->users=NULL; e->n_users=0; e->cap_users=0;
+    // remove entry itself
+    free(e->file);
+    if (e != &g_state.requests[g_state.n_requests-1]) *e = g_state.requests[g_state.n_requests-1];
+    g_state.n_requests--;
+    return 1;
 }
 
 static void parse_requests_object(const char *json) {
