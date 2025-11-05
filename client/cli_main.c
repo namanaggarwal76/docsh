@@ -610,6 +610,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "RENAME", 1);
         json_put_string_field(payload, sizeof(payload), "file", of, 0);
         json_put_string_field(payload, sizeof(payload), "newFile", nf, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
     } else if (strcmp(cmd, "migrate") == 0) {
         if (argc < 6) { fprintf(stderr, "migrate requires <file> <targetSsId>\n"); close(fd); return 1; }
@@ -617,6 +618,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "MIGRATE", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_int_field(payload, sizeof(payload), "targetSsId", target, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
     } else if (strcmp(cmd, "put-direct") == 0) {
         if (argc < 7) { fprintf(stderr, "put-direct requires <ssDataPort> <file> <body>\n"); close(fd); return 1; }
@@ -640,6 +642,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "UNDO", 0);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp = NULL; uint32_t rlen = 0;
@@ -693,6 +696,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "REVERT", 0);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp = NULL; uint32_t rlen = 0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
@@ -754,6 +758,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "MOVE", 1);
         json_put_string_field(payload, sizeof(payload), "src", src, 0);
         json_put_string_field(payload, sizeof(payload), "dst", dst, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
     } else if (strcmp(cmd, "REQUEST_ACCESS") == 0 || strcmp(cmd, "request-access") == 0) {
         if (argc < 5) { fprintf(stderr, "REQUEST_ACCESS requires <file> [ -R | -W ]\n"); close(fd); return 1; }
@@ -802,6 +807,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "CHECKPOINT", 0);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }

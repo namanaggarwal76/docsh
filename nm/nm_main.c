@@ -283,6 +283,7 @@ static void *client_thread(void *arg) {
                                             for (ss_entry_t *se=g_ss_list; se; se=se->next) if (se->ss_id != chosen_ssid) { if (nr < 4) repls[nr++] = se->ss_id; }
                                             pthread_mutex_unlock(&g_mu);
                                             if (nr>0) nm_state_set_replicas(file, repls, 1); // at least one replica
+                                            (void)nm_state_save("nm_state.json");
                                             ssid = chosen_ssid;
                                             fprintf(stderr, "[NM] mapping set %s -> ssId=%d\n", file, ssid);
                                         }
@@ -377,6 +378,7 @@ static void *client_thread(void *arg) {
                                         // choose a replica and replicate CREATE asynchronously
                                         int repls[4]; size_t nr=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *se=g_ss_list; se; se=se->next){ if (se->ss_id!=ssid && nr<4) repls[nr++]=se->ss_id; } pthread_mutex_unlock(&g_mu);
                                         if (nr>0) { nm_state_set_replicas(file, repls, 1); schedule_cmd_repl("CREATE", file, NULL, repls[0]); }
+                                        (void)nm_state_save("nm_state.json");
                                         const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
                                     else if (strstr(r, "ERR_CONFLICT")) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                     else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -425,6 +427,7 @@ static void *client_thread(void *arg) {
                                             // replicate delete to replicas
                                             int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
                                             for (size_t i=0;i<nr;i++) schedule_cmd_repl("DELETE", file, NULL, repls[i]);
+                                            (void)nm_state_save("nm_state.json");
                                             const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                         } else if (strstr(r, "ERR_NOTFOUND")) {
                                             const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er));
@@ -539,6 +542,7 @@ static void *client_thread(void *arg) {
                                                             }
                                                             // Update mapping
                                                             nm_dir_set(file, target);
+                                                            (void)nm_state_save("nm_state.json");
                                                             const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                                         }
                                                     }
@@ -588,6 +592,7 @@ static void *client_thread(void *arg) {
                                                 // replicate rename to replicas
                                                 int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
                                                 for (size_t i=0;i<nr;i++) schedule_cmd_repl("RENAME", file, nfile, repls[i]);
+                                                (void)nm_state_save("nm_state.json");
                                                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                             } else if (strstr(r, "ERR_CONFLICT")) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                             else if (strstr(r, "ERR_NOTFOUND")) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -608,6 +613,7 @@ static void *client_thread(void *arg) {
                 const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {
                 nm_state_add_folder(path);
+                (void)nm_state_save("nm_state.json");
                 const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             }
         } else if (strcmp(type, "VIEWFOLDER") == 0) {
@@ -686,6 +692,7 @@ static void *client_thread(void *arg) {
                             if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
                                 char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
                                     nm_dir_rename(src, dst); nm_acl_rename(src, dst);
+                                    (void)nm_state_save("nm_state.json");
                                     const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                 } else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                 free(r);
@@ -719,7 +726,7 @@ static void *client_thread(void *arg) {
                             free(r); close(sfd);
                         }
                         if (failures) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                        else { const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        else { (void)nm_state_save("nm_state.json"); const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                     }
                 }
             }
@@ -730,6 +737,7 @@ static void *client_thread(void *arg) {
             } else {
                 int perm = (strcmp(mode, "RW")==0)? (ACL_R|ACL_W) : (strcmp(mode, "W")==0? ACL_W : ACL_R);
                 nm_acl_grant(file, target, perm);
+                (void)nm_state_save("nm_state.json");
                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
             }
         } else if (strcmp(type, "REMACCESS") == 0) {
@@ -738,6 +746,7 @@ static void *client_thread(void *arg) {
                 const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {
                 nm_acl_revoke(file, target);
+                (void)nm_state_save("nm_state.json");
                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
             }
         } else if (strcmp(type, "CLIENT_HELLO") == 0) {
@@ -750,6 +759,7 @@ static void *client_thread(void *arg) {
                     free(buf); close(fd); return NULL;
                 }
                 nm_state_set_user_active(user, 1);
+                (void)nm_state_save("nm_state.json");
             } else {
                 printf("[NM] Client hello (user unknown)\n");
             }
@@ -766,6 +776,7 @@ static void *client_thread(void *arg) {
             if (!user[0]) { const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
             else {
                 nm_state_set_user_active(user, active ? 1 : 0);
+                (void)nm_state_save("nm_state.json");
                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
             }
         } else if (strcmp(type, "LIST_SS") == 0) {
@@ -799,7 +810,7 @@ static void *client_thread(void *arg) {
                 else {
                     // Try add; if already exists, return ERR_CONFLICT as closest existing code
                     int added = nm_state_add_request(file, user);
-                    if (added) { const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
+                    if (added) { (void)nm_state_save("nm_state.json"); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
                     else { const char *er="{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 }
             }
@@ -823,12 +834,13 @@ static void *client_thread(void *arg) {
                 else {
                     (void)json_get_string_field(buf, "mode", mode, sizeof(mode)); int perm = (strcmp(mode, "W")==0? (ACL_R|ACL_W) : (strcmp(mode, "RW")==0? (ACL_R|ACL_W) : ACL_R));
                     nm_acl_grant(file, target, perm); nm_state_remove_request(file, target);
+                    (void)nm_state_save("nm_state.json");
                     const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                 }
             }
         } else if (strcmp(type, "DENY_ACCESS") == 0) {
             char file[128]; char owner[128]; char target[128]; if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", owner, sizeof(owner))!=0 || json_get_string_field(buf, "target", target, sizeof(target))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-            else { char ow[128]; if (nm_acl_get_owner(file, ow, sizeof(ow))!=0 || strcmp(ow, owner)!=0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } else { nm_state_remove_request(file, target); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); } }
+            else { char ow[128]; if (nm_acl_get_owner(file, ow, sizeof(ow))!=0 || strcmp(ow, owner)!=0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } else { nm_state_remove_request(file, target); (void)nm_state_save("nm_state.json"); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); } }
         } else if (strcmp(type, "STATS") == 0) {
             // Count mapped files accurately by requesting a large snapshot
             char f2[1024][128]; int s2[1024]; size_t nf = nm_state_get_dir(f2, s2, 1024);
@@ -896,6 +908,7 @@ static void *client_thread(void *arg) {
             char file[128]; int ssid = 0;
             if (json_get_string_field(buf, "file", file, sizeof(file)) == 0 && json_get_int_field(buf, "ssId", &ssid) == 0) {
                 nm_dir_set(file, ssid);
+                (void)nm_state_save("nm_state.json");
                 const char *resp = "{\"status\":\"OK\"}";
                 send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {
