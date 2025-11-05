@@ -1,9 +1,9 @@
 {
-  "users":["alice","naman"],
-  "active":[],
-  "directory":{"report.txt":1,"demo.txt":1,"udtest.txt":1,"test.txt":1,"mouse.txt":1,"new.txt":1,"helo.sh":1,"ft/doc.txt":1,"ft/doc2.txt":1},
-  "acls":{"udtest.txt":{"owner":"owner","grants":{"anonymous":"RW"}}},
-  "replicas":{"report.txt":[],"demo.txt":[],"udtest.txt":[],"test.txt":[1],"mouse.txt":[1],"new.txt":[1],"helo.sh":[1],"ft/doc.txt":[1],"ft/doc2.txt":[2]},
-  "requests":{},
-  "folders":[]
+  "users":["naman","manav","arnav"],
+  "active":["naman","arnav"],
+  "directory":{"NAMAN":2,"bhosda.txt":2,"c.tct":2,"bash.sh":1,"new.txt":2},
+  "acls":{"NAMAN":{"owner":"naman","grants":{"naman":"RW","manav":"RW"}},"bhosda.txt":{"owner":"naman","grants":{"naman":"RW","anonymous":"R"}},"c.tct":{"owner":"naman","grants":{"naman":"RW"}},"bash.sh":{"owner":"naman","grants":{"naman":"RW"}},"new.txt":{"owner":"naman","grants":{"naman":"RW","anonymous":"RW"}}},
+  "replicas":{"NAMAN":[1],"bhosda.txt":[1],"c.tct":[1],"bash.sh":[2],"new.txt":[1]},
+  "requests":{"NAMAN":["manav"]},
+  "folders":["NAMAN/"]
 }

@@ -2220,7 +2220,7 @@ If you want, I can also:
 
 ---
 
-_**User (2025-11-05 22:55Z)**_
+_**User (2025-11-05 22:59Z)**_
 
 UPDATE THE README ACCORDING TO THE CLI_MAIN FILE, I  #codebase 
 
@@ -2236,6 +2236,84 @@ I need to focus on updating the README, but I should be cautious not to accident
 ```
 
 ```
+**Updating README details**
+
+I've updated the README, and now I need to provide a progress update and outline what's next according to the tool batch rules. The user asked for a list of removed features, so I must include that, but I noticed there isn't a "Removed features" section yet. I should definitely create one in the README. The instructions say to update it based on CLI_MAIN and the removed features list. I should add a "Removed/Deprecated CLI commands" section as planned.**Clarifying removed features**
+
+The summary indicates that several stubs for commands have been removed, including dir-set, lookup-read, read-noticket, and others like APPROVE_ACCESS and DENY_ACCESS. The canonical form for addaccess now is ADDACCESS -R|-W, and I need to note that the old variant was removed. For aliases, we need to list those that were removed, such as mkdir, lsf, and mv, but keep in mind that the rename alias still exists, just in uppercase. The user wants a comprehensive list of all these removed features in the README.**Updating README with removed commands**
+
+I need to update the README to include a section titled "Removed commands (client-only)" where I can list the commands that have been removed. It’s essential to map these to their replacements or indicate if they’re not applicable (N/A). This is going to help users understand what has changed. I plan to apply another patch to the README to add this section near the end for clarity. Let's make sure it’s well organized!
+```
+
+```
+**Running build check**
+
+I think we should run a build to confirm everything is alright, even though the documentation change doesn’t require it. The "Validation gates" instruction mentions running build/tests for substantive changes, but since we haven't modified any code, compiling isn't essential. Still, running `make` to check for potential issues could be useful. Let’s move quickly on this and perform the build check to ensure nothing else is broken.**Summarizing build updates**
+
+I've got the build completed successfully. Now I need to update the user on the actions taken, which includes updating the README with canonical commands and adding a list of removed commands. The build has passed, so that’s great! I’ll provide a concise completion summary for the user and explain the next steps. The user wanted the README updated according to cli_main, and that’s done, along with the removed features section.I’ll align the documentation with the current CLI and include a clear list of removed commands, then sanity-check the build.
+
+## Actions taken
+
+- Updated README to match the canonical, case-insensitive commands implemented in `cli_main.c`:
+  - Replaced legacy aliases with canonical names:
+    - CREATEFOLDER (was mkdir)
+    - VIEWFOLDER (was lsf)
+    - MOVE (was mv)
+    - RENAME (kept as canonical)
+    - CHECKPOINT/LISTCHECKPOINTS/VIEWCHECKPOINT/REVERT (uppercase, canonical)
+  - Updated all usage examples to use the canonical names.
+  - Added a short “Notes” subsection to clarify case-insensitivity and behavior contracts.
+- Added a new “Removed commands (client-only)” section listing deprecated/admin/internal commands and alias replacements.
+- Rebuilt the project to ensure everything still compiles.
+
+## Files changed
+
+- `README.md`
+  - Aligned the “Final feature set (CLI)” list to canonical names.
+  - Updated examples in sections 1–5 to canonical commands.
+  - Added “Notes” on case-insensitivity and behavior.
+  - Added “Removed commands (client-only)” with a transparent list.
+
+## Removed commands (documented)
+
+- dir-set (deprecated)
+- lookup-read (use READ)
+- read-noticket (insecure variant; use READ)
+- migrate (internal/testing)
+- put-direct (internal/testing)
+- history (use LISTCHECKPOINTS/VIEWCHECKPOINT for snapshots)
+- approve_access / deny_access (admin-only; consolidated workflow via REQUEST_ACCESS/VIEWREQUESTS)
+- stats (internal)
+- revertc (internal/testing)
+- hello (internal/testing)
+- Aliases removed:
+  - mkdir → CREATEFOLDER
+  - lsf → VIEWFOLDER
+  - mv → MOVE
+
+## Quality gates
+
+- Build: PASS (make -j4)
+- Lint/Typecheck: N/A (C project; warnings-as-errors enabled—no issues)
+- Tests: None present to run
+
+## Notes
+
+- Commands are case-insensitive, but the README now shows the canonical names exactly as the CLI help prints.
+- Server logic and helpers were not changed; only the client CLI and docs were updated.
+
+If you want, I can add a short CLI “help” snapshot to the README to mirror `cli_main.c` output verbatim, or wire up a tiny smoke-test script for CREATE/WRITE/READ/UNDO and folder ops.
+
+---
+
+_**User (2025-11-05 23:15Z)**_
+
+in write say i write a line at line 0, as hell world. then when i try to access line 1 (0 indexed), the terminal crashes, fix this issue #codebase 
+
+---
+
+_**Agent (model copilot/gpt-5)**_
+
 
 
 ---

@@ -340,7 +340,7 @@ static void *data_server_thread(void *arg) {
                                     }
                                     if (sidx < 0 || sidx > doc.num_sentences) { fprintf(stderr, "[SS] sidx out of range: sidx=%d num_sentences=%d\n", sidx, doc.num_sentences); ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                                     else if (sidx == doc.num_sentences) {
-                                        // Allow appending a new empty sentence
+                                        // Allow appending a new empty sentence and start a write session on it
                                         int ns = doc.num_sentences + 1;
                                         char ***sw = (char ***)realloc(doc.sent_words, (size_t)ns * sizeof(char **));
                                         int *wcarr = (int *)realloc(doc.word_counts, (size_t)ns * sizeof(int));
@@ -348,6 +348,11 @@ static void *data_server_thread(void *arg) {
                                         else {
                                             doc.sent_words = sw; doc.word_counts = wcarr; doc.num_sentences = ns;
                                             doc.sent_words[ns-1] = NULL; doc.word_counts[ns-1] = 0;
+                                            // Start session now that the sentence exists
+                                            ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
+                                            fprintf(stderr, "[SS] BEGIN_WRITE session started (append new sentence), sidx=%d\n", sidx); fflush(stderr);
+                                            const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                                            // Do not free pre/content here; handled after outer scope
                                         }
                                     }
                                     else {

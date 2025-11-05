@@ -137,12 +137,6 @@ int ss_tokenize(const char *text, ss_doc_tokens_t *out) {
         sent_words[cur_s][word_counts[cur_s]++] = w;
     }
 
-    // If the last sentence is empty (no words), reduce num_sentences
-    if (num_sent > 1 && word_counts[num_sent - 1] == 0) {
-        free(sent_words[num_sent - 1]);
-        num_sent--;
-    }
-
     out->sent_words = sent_words;
     out->word_counts = word_counts;
     out->num_sentences = num_sent;
