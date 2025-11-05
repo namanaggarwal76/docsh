@@ -4,11 +4,15 @@
 #include <unistd.h>
 #include <termios.h>
 #include <ctype.h>
+#include <strings.h>
 
 #include "../common/net_proto.h"
 
 // Forward declaration for reuse in REPL
 static int client_handle_oneshot(int argc, char **argv, const char *username);
+
+// Case-insensitive command compare
+#define CMDEQ(a,b) (strcasecmp((a),(b))==0)
 
 // Tiny helpers
 static void rstrip(char *s){ if(!s) return; size_t n=strlen(s); while(n && (s[n-1]=='\n'||s[n-1]=='\r'||s[n-1]==' '||s[n-1]=='\t')) s[--n]='\0'; }
@@ -342,16 +346,39 @@ int main(int argc, char **argv) {
         char prompt[256]; snprintf(prompt, sizeof(prompt), "%s@docs> ", username[0]?username:"user");
         if (read_line_tty(prompt, line, sizeof(line), &hist) != 0) break;
         rstrip(line);
-        if (!line[0]) continue;
-        if (strcmp(line, "exit")==0 || strcmp(line, "quit")==0) break;
-        if (strcmp(line, "clear")==0 || strcmp(line, "CLEAR")==0) {
+    if (!line[0]) continue;
+    if (CMDEQ(line, "exit") || CMDEQ(line, "quit")) break;
+    if (CMDEQ(line, "clear")) {
             // Clear screen like terminal 'clear'
             fputs("\x1b[2J\x1b[H", stdout);
             fflush(stdout);
             continue;
         }
-        if (strcmp(line, "help")==0) {
-            printf("Commands: VIEW [-a] [-l] | READ <file> | CREATE <file> [-r] [-w] | WRITE <file> <sentenceIndex> | UNDO <file> | INFO <file> | DELETE <file> | STREAM <file> | LIST | ADDACCESS -R|-W <file> <user> | REMACCESS <file> <user> | REQUEST_ACCESS <file> [-R|-W] | VIEWREQUESTS <file> | APPROVE_ACCESS <file> -R|-W <user> | DENY_ACCESS <file> <user> | STATS | EXEC <file> | CLEAR\n");
+        if (CMDEQ(line, "help")) {
+            printf("Commands:\n");
+            printf("  VIEW [-a] [-l]\n");
+            printf("  READ <file>\n");
+            printf("  CREATE <file> [-r] [-w]\n");
+            printf("  WRITE <file> <sentenceIndex>\n");
+            printf("  UNDO <file>\n");
+            printf("  INFO <file>\n");
+            printf("  DELETE <file>\n");
+            printf("  STREAM <file>\n");
+            printf("  LIST\n");
+            printf("  ADDACCESS -R|-W <file> <user>\n");
+            printf("  REMACCESS <file> <user>\n");
+            printf("  REQUEST_ACCESS <file> [-R|-W]\n");
+            printf("  VIEWREQUESTS <file>\n");
+            printf("  EXEC <file>\n");
+            printf("  CREATEFOLDER <path>\n");
+            printf("  VIEWFOLDER <path>\n");
+            printf("  MOVE <src> <dst>\n");
+            printf("  RENAME <old> <new>\n");
+            printf("  CHECKPOINT <file> <name>\n");
+            printf("  VIEWCHECKPOINT <file> <name>\n");
+            printf("  LISTCHECKPOINTS <file>\n");
+            printf("  REVERT <file> <version|checkpointName>\n");
+            printf("  CLEAR | EXIT\n");
             continue;
         }
         // Tokenize
@@ -379,7 +406,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
     uint16_t nm_port = (uint16_t)atoi(argv[2]);
     const char *cmd = argv[3];
     int fd = tcp_connect(nm_host, nm_port);
-    if (strcmp(cmd, "CLEAR") == 0 || strcmp(cmd, "clear") == 0) {
+    if (CMDEQ(cmd, "CLEAR")) {
         if (fd >= 0) close(fd);
         fputs("\x1b[2J\x1b[H", stdout);
         fflush(stdout);
@@ -388,16 +415,11 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
     if (fd < 0) { perror("connect NM"); return 1; }
 
     char payload[512]; payload[0] = '\0';
-    if (strcmp(cmd, "hello") == 0) {
-        // no-op, already sent
+    if (CMDEQ(cmd, "LIST")) {
         json_put_string_field(payload, sizeof(payload), "type", "LIST_USERS", 1);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "LIST") == 0 || strcmp(cmd, "list-users") == 0 || strcmp(cmd, "list") == 0) {
-        json_put_string_field(payload, sizeof(payload), "type", "LIST_USERS", 1);
-        json_put_string_field(payload, sizeof(payload), "user", username, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "view") == 0 || strcmp(cmd, "VIEW") == 0) {
+    } else if (CMDEQ(cmd, "VIEW")) {
         json_put_string_field(payload, sizeof(payload), "type", "VIEW", 1);
         // collect flags from argv[4..]
         char flags[32] = {0};
@@ -407,36 +429,21 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         }
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "INFO") == 0 || strcmp(cmd, "info") == 0) {
+    } else if (CMDEQ(cmd, "INFO")) {
         if (argc < 5) { fprintf(stderr, "INFO requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "INFO", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload)-strlen(payload)-1);
-    } else if (strcmp(cmd, "EXEC") == 0 || strcmp(cmd, "exec") == 0) {
+    } else if (CMDEQ(cmd, "EXEC")) {
         if (argc < 5) { fprintf(stderr, "EXEC requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "EXEC", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload)-strlen(payload)-1);
-    } else if (strcmp(cmd, "dir-set") == 0) {
-        if (argc < 6) { fprintf(stderr, "dir-set requires <file> <ssId>\n"); close(fd); return 1; }
-        const char *file = argv[4]; int ssid = atoi(argv[5]);
-        json_put_string_field(payload, sizeof(payload), "type", "DIR_SET", 1);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        json_put_int_field(payload, sizeof(payload), "ssId", ssid, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "lookup-read") == 0) {
-        if (argc < 5) { fprintf(stderr, "lookup-read requires <file>\n"); close(fd); return 1; }
-        const char *file = argv[4];
-        json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
-        json_put_string_field(payload, sizeof(payload), "op", "READ", 0);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        json_put_string_field(payload, sizeof(payload), "user", username, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "read") == 0 || strcmp(cmd, "READ") == 0) {
+    } else if (CMDEQ(cmd, "READ")) {
         if (argc < 5) { fprintf(stderr, "read requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         // First LOOKUP
@@ -468,7 +475,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
     print_human("SS", r2);
         free(r2); close(sfd);
         return 0;
-    } else if (strcmp(cmd, "STREAM") == 0 || strcmp(cmd, "stream") == 0) {
+    } else if (CMDEQ(cmd, "STREAM")) {
         if (argc < 5) { fprintf(stderr, "STREAM requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         // LOOKUP READ
@@ -496,36 +503,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
             free(fr);
         }
         printf("\n"); close(sfd); return 0;
-    } else if (strcmp(cmd, "read-noticket") == 0) {
-        if (argc < 5) { fprintf(stderr, "read-noticket requires <file>\n"); close(fd); return 1; }
-        const char *file = argv[4];
-        // Use LOOKUP to learn SS endpoint, but intentionally omit ticket in READ
-        json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
-        json_put_string_field(payload, sizeof(payload), "op", "READ", 0);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-        if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
-        char *resp = NULL; uint32_t rlen = 0;
-        if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-        fprintf(stderr, "[CLI] LOOKUP response: %.*s\n", rlen, resp ? resp : "");
-        int dport = 0; char ssaddr[64] = {0};
-        int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0);
-        free(resp); close(fd);
-        if (!ok || dport <= 0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
-        // Connect to SS and READ without ticket
-        int sfd = tcp_connect(ssaddr, (uint16_t)dport);
-        if (sfd < 0) { perror("connect SS"); return 1; }
-        char req[256]; req[0] = '\0';
-        json_put_string_field(req, sizeof(req), "type", "READ", 1);
-        json_put_string_field(req, sizeof(req), "file", file, 0);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send READ"); close(sfd); return 1; }
-        char *r2 = NULL; uint32_t r2len = 0;
-        if (recv_msg(sfd, &r2, &r2len) < 0) { perror("recv READ"); close(sfd); return 1; }
-    print_human("SS", r2);
-        free(r2); close(sfd);
-        return 0;
-    } else if (strcmp(cmd, "create") == 0 || strcmp(cmd, "CREATE") == 0) {
+    } else if (CMDEQ(cmd, "CREATE")) {
         if (argc < 5) { fprintf(stderr, "create requires <file> [-r] [-w]\n"); close(fd); return 1; }
         const char *file = argv[4];
         int pubR = 0, pubW = 0;
@@ -539,14 +517,14 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         if (pubR) json_put_int_field(payload, sizeof(payload), "publicRead", 1, 0);
         if (pubW) json_put_int_field(payload, sizeof(payload), "publicWrite", 1, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "delete") == 0 || strcmp(cmd, "DELETE") == 0) {
+    } else if (CMDEQ(cmd, "DELETE")) {
         if (argc < 5) { fprintf(stderr, "delete requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "DELETE", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "WRITE") == 0) {
+    } else if (CMDEQ(cmd, "WRITE")) {
         if (argc < 6) { fprintf(stderr, "WRITE requires <file> <sentenceIndex>\n"); close(fd); return 1; }
         const char *file = argv[4]; int sidx = atoi(argv[5]);
         // LOOKUP WRITE
@@ -584,61 +562,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         // end write
         char ereq[64]; ereq[0]='\0'; json_put_string_field(ereq, sizeof(ereq), "type", "END_WRITE", 1); strncat(ereq, "}", sizeof(ereq)-strlen(ereq)-1);
         if (send_msg(sfd, ereq, (uint32_t)strlen(ereq)) == 0) { char *er=NULL; uint32_t el=0; if (recv_msg(sfd, &er, &el) == 0) print_human("SS", er); free(er);} close(sfd); return 0;
-    } else if (strcmp(cmd, "write") == 0) {
-        if (argc < 8) { fprintf(stderr, "write requires <file> <sentenceIndex> <wordIndex> <content>\n"); close(fd); return 1; }
-        const char *file = argv[4];
-        int sidx = atoi(argv[5]);
-        int widx = atoi(argv[6]);
-        const char *content = argv[7];
-        // LOOKUP for WRITE
-        json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
-        json_put_string_field(payload, sizeof(payload), "op", "WRITE", 0);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-        if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
-        char *resp = NULL; uint32_t rlen = 0;
-    if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-    fprintf(stderr, "[CLI] LOOKUP response: %.*s\n", rlen, resp ? resp : "");
-    int dport = 0; char ssaddr[64] = {0}; char ticket[256] = {0};
-    int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
-        free(resp); close(fd);
-        if (!ok || dport <= 0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
-        int sfd = tcp_connect(ssaddr, (uint16_t)dport);
-        if (sfd < 0) { perror("connect SS"); return 1; }
-        // BEGIN_WRITE
-        char req[512]; req[0] = '\0';
-        json_put_string_field(req, sizeof(req), "type", "BEGIN_WRITE", 1);
-        json_put_string_field(req, sizeof(req), "file", file, 0);
-        json_put_int_field(req, sizeof(req), "sentenceIndex", sidx, 0);
-    json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send BEGIN_WRITE"); close(sfd); return 1; }
-        char *r1 = NULL; uint32_t r1l = 0; if (recv_msg(sfd, &r1, &r1l) < 0) { perror("recv BEGIN_WRITE"); close(sfd); return 1; }
-    fprintf(stderr, "[CLI] BEGIN_WRITE response: %.*s\n", r1l, r1 ? r1 : "");
-    if (!r1 || !strstr(r1, "\"status\":\"OK\"")) { free(r1); close(sfd); return 1; }
-        free(r1);
-        // APPLY single change
-        req[0] = '\0';
-        json_put_string_field(req, sizeof(req), "type", "APPLY", 1);
-        json_put_int_field(req, sizeof(req), "wordIndex", widx, 0);
-        json_put_string_field(req, sizeof(req), "content", content, 0);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send APPLY"); close(sfd); return 1; }
-        char *r2 = NULL; uint32_t r2l = 0; if (recv_msg(sfd, &r2, &r2l) < 0) { perror("recv APPLY"); close(sfd); return 1; }
-    fprintf(stderr, "[CLI] APPLY response: %.*s\n", r2l, r2 ? r2 : "");
-    if (!r2 || !strstr(r2, "\"status\":\"OK\"")) { free(r2); close(sfd); return 1; }
-        free(r2);
-        // END_WRITE
-        req[0] = '\0';
-        json_put_string_field(req, sizeof(req), "type", "END_WRITE", 1);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send END_WRITE"); close(sfd); return 1; }
-    char *r3 = NULL; uint32_t r3l = 0; if (recv_msg(sfd, &r3, &r3l) < 0) { perror("recv END_WRITE"); close(sfd); return 1; }
-    fprintf(stderr, "[CLI] END_WRITE response: %.*s\n", r3l, r3 ? r3 : "");
-    printf("[CLI] SS response: %.*s\n", r3l, r3 ? r3 : "");
-        free(r3); close(sfd);
-        return 0;
-    } else if (strcmp(cmd, "rename") == 0) {
+    } else if (CMDEQ(cmd, "RENAME")) {
         if (argc < 6) { fprintf(stderr, "rename requires <old> <new>\n"); close(fd); return 1; }
         const char *of = argv[4]; const char *nf = argv[5];
         json_put_string_field(payload, sizeof(payload), "type", "RENAME", 1);
@@ -646,30 +570,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "newFile", nf, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "migrate") == 0) {
-        if (argc < 6) { fprintf(stderr, "migrate requires <file> <targetSsId>\n"); close(fd); return 1; }
-        const char *file = argv[4]; int target = atoi(argv[5]);
-        json_put_string_field(payload, sizeof(payload), "type", "MIGRATE", 1);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        json_put_int_field(payload, sizeof(payload), "targetSsId", target, 0);
-        json_put_string_field(payload, sizeof(payload), "user", username, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "put-direct") == 0) {
-        if (argc < 7) { fprintf(stderr, "put-direct requires <ssDataPort> <file> <body>\n"); close(fd); return 1; }
-        int dport = atoi(argv[4]); const char *file = argv[5]; const char *body = argv[6];
-        // Close NM fd; we will connect to SS directly
-        close(fd);
-        int sfd = tcp_connect("127.0.0.1", (uint16_t)dport);
-        if (sfd < 0) { perror("connect SS"); return 1; }
-        char req[1024]; req[0] = '\0';
-        json_put_string_field(req, sizeof(req), "type", "PUT", 1);
-        json_put_string_field(req, sizeof(req), "file", file, 0);
-        json_put_string_field(req, sizeof(req), "body", body, 0);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send PUT"); close(sfd); return 1; }
-        char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) < 0) { perror("recv PUT"); close(sfd); return 1; }
-        printf("[CLI] SS response: %.*s\n", rl, r?r:""); free(r); close(sfd); return 0;
-    } else if (strcmp(cmd, "undo") == 0 || strcmp(cmd, "UNDO") == 0) {
+    } else if (CMDEQ(cmd, "UNDO")) {
         if (argc < 5) { fprintf(stderr, "undo requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         // LOOKUP for UNDO
@@ -699,34 +600,9 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
     print_human("SS", r2);
         free(r2); close(sfd);
         return 0;
-    } else if (strcmp(cmd, "history") == 0) {
-        if (argc < 5) { fprintf(stderr, "history requires <file>\n"); close(fd); return 1; }
-        const char *file = argv[4];
-        json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
-        json_put_string_field(payload, sizeof(payload), "op", "HISTORY", 0);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-        if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
-        char *resp = NULL; uint32_t rlen = 0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-        fprintf(stderr, "[CLI] LOOKUP response: %.*s\n", rlen, resp ? resp : "");
-        int dport = 0; char ssaddr[64] = {0}; char ticket[256] = {0};
-        int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
-        free(resp); close(fd);
-        if (!ok || dport <= 0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
-        int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
-        char req[256]; req[0] = '\0';
-        json_put_string_field(req, sizeof(req), "type", "HISTORY", 1);
-        json_put_string_field(req, sizeof(req), "file", file, 0);
-        json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send HISTORY"); close(sfd); return 1; }
-        char *r2 = NULL; uint32_t r2l = 0; if (recv_msg(sfd, &r2, &r2l) < 0) { perror("recv HISTORY"); close(sfd); return 1; }
-    print_human("SS", r2);
-        free(r2); close(sfd);
-        return 0;
-    } else if (strcmp(cmd, "revert") == 0) {
-        if (argc < 6) { fprintf(stderr, "revert requires <file> <version>\n"); close(fd); return 1; }
-        const char *file = argv[4]; int ver = atoi(argv[5]);
+    } else if (CMDEQ(cmd, "REVERT")) {
+        if (argc < 6) { fprintf(stderr, "revert requires <file> <version|checkpointName>\n"); close(fd); return 1; }
+        const char *file = argv[4]; const char *ver_or_name = argv[5];
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "REVERT", 0);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
@@ -743,7 +619,13 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         char req[256]; req[0] = '\0';
         json_put_string_field(req, sizeof(req), "type", "REVERT", 1);
         json_put_string_field(req, sizeof(req), "file", file, 0);
-        json_put_int_field(req, sizeof(req), "version", ver, 0);
+        // Accept either a numeric version or a checkpoint name
+        int is_num = 1; for (const char *p = ver_or_name; *p; ++p) { if (!isdigit((unsigned char)*p)) { is_num = 0; break; } }
+        if (is_num) {
+            json_put_int_field(req, sizeof(req), "version", atoi(ver_or_name), 0);
+        } else {
+            json_put_string_field(req, sizeof(req), "name", ver_or_name, 0);
+        }
         json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
         strncat(req, "}", sizeof(req) - strlen(req) - 1);
         if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send REVERT"); close(sfd); return 1; }
@@ -751,7 +633,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
     print_human("SS", r2);
         free(r2); close(sfd);
         return 0;
-    } else if (strcmp(cmd, "ADDACCESS") == 0) {
+    } else if (CMDEQ(cmd, "ADDACCESS")) {
         if (argc < 7) { fprintf(stderr, "ADDACCESS requires -R|-W <file> <user>\n"); close(fd); return 1; }
         const char *flag = argv[4]; const char *file = argv[5]; const char *user = argv[6]; const char *mode = (strcmp(flag, "-W")==0?"RW":"R");
         json_put_string_field(payload, sizeof(payload), "type", "ADDACCESS", 1);
@@ -759,42 +641,34 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "user", user, 0);
         json_put_string_field(payload, sizeof(payload), "mode", mode, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "addaccess") == 0) {
-        if (argc < 7) { fprintf(stderr, "addaccess requires <file> <user> <R|W|RW>\n"); close(fd); return 1; }
-        const char *file = argv[4]; const char *user = argv[5]; const char *mode = argv[6];
-        json_put_string_field(payload, sizeof(payload), "type", "ADDACCESS", 1);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        json_put_string_field(payload, sizeof(payload), "user", user, 0);
-        json_put_string_field(payload, sizeof(payload), "mode", mode, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "REMACCESS") == 0 || strcmp(cmd, "remaccess") == 0) {
+    } else if (CMDEQ(cmd, "REMACCESS")) {
         if (argc < 6) { fprintf(stderr, "remaccess requires <file> <user>\n"); close(fd); return 1; }
         const char *file = argv[4]; const char *user = argv[5];
         json_put_string_field(payload, sizeof(payload), "type", "REMACCESS", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", user, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "mkdir") == 0) {
-        if (argc < 5) { fprintf(stderr, "mkdir requires <path>\n"); close(fd); return 1; }
+    } else if (CMDEQ(cmd, "CREATEFOLDER")) {
+        if (argc < 5) { fprintf(stderr, "CREATEFOLDER requires <path>\n"); close(fd); return 1; }
         const char *path = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "CREATEFOLDER", 1);
         json_put_string_field(payload, sizeof(payload), "path", path, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "lsf") == 0) {
-        if (argc < 5) { fprintf(stderr, "lsf requires <path>\n"); close(fd); return 1; }
+    } else if (CMDEQ(cmd, "VIEWFOLDER")) {
+        if (argc < 5) { fprintf(stderr, "VIEWFOLDER requires <path>\n"); close(fd); return 1; }
         const char *path = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "VIEWFOLDER", 1);
         json_put_string_field(payload, sizeof(payload), "path", path, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "mv") == 0) {
-        if (argc < 6) { fprintf(stderr, "mv requires <src> <dst>\n"); close(fd); return 1; }
+    } else if (CMDEQ(cmd, "MOVE")) {
+        if (argc < 6) { fprintf(stderr, "MOVE requires <src> <dst>\n"); close(fd); return 1; }
         const char *src = argv[4]; const char *dst = argv[5];
         json_put_string_field(payload, sizeof(payload), "type", "MOVE", 1);
         json_put_string_field(payload, sizeof(payload), "src", src, 0);
         json_put_string_field(payload, sizeof(payload), "dst", dst, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "REQUEST_ACCESS") == 0 || strcmp(cmd, "request-access") == 0) {
+    } else if (CMDEQ(cmd, "REQUEST_ACCESS")) {
         if (argc < 5) { fprintf(stderr, "REQUEST_ACCESS requires <file> [ -R | -W ]\n"); close(fd); return 1; }
         const char *file = argv[4]; const char *mode = "R";
         if (argc >= 6) {
@@ -806,36 +680,15 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         json_put_string_field(payload, sizeof(payload), "mode", mode, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "VIEWREQUESTS") == 0 || strcmp(cmd, "viewrequests") == 0) {
+    } else if (CMDEQ(cmd, "VIEWREQUESTS")) {
         if (argc < 5) { fprintf(stderr, "VIEWREQUESTS requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "VIEWREQUESTS", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "APPROVE_ACCESS") == 0 || strcmp(cmd, "approve-access") == 0) {
-        if (argc < 7) { fprintf(stderr, "APPROVE_ACCESS requires <file> -R|-W <user>\n"); close(fd); return 1; }
-        const char *file = argv[4]; const char *flag = argv[5]; const char *user = argv[6]; const char *mode = (strcmp(flag, "-W")==0?"W":"R");
-        json_put_string_field(payload, sizeof(payload), "type", "APPROVE_ACCESS", 1);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        json_put_string_field(payload, sizeof(payload), "target", user, 0);
-        json_put_string_field(payload, sizeof(payload), "mode", mode, 0);
-        json_put_string_field(payload, sizeof(payload), "user", username, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "DENY_ACCESS") == 0 || strcmp(cmd, "deny-access") == 0) {
-        if (argc < 6) { fprintf(stderr, "DENY_ACCESS requires <file> <user>\n"); close(fd); return 1; }
-        const char *file = argv[4]; const char *user = argv[5];
-        json_put_string_field(payload, sizeof(payload), "type", "DENY_ACCESS", 1);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        json_put_string_field(payload, sizeof(payload), "target", user, 0);
-        json_put_string_field(payload, sizeof(payload), "user", username, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "STATS") == 0 || strcmp(cmd, "stats") == 0) {
-        json_put_string_field(payload, sizeof(payload), "type", "STATS", 1);
-        json_put_string_field(payload, sizeof(payload), "user", username, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-    } else if (strcmp(cmd, "checkpoint") == 0) {
-        if (argc < 6) { fprintf(stderr, "checkpoint requires <file> <name>\n"); close(fd); return 1; }
+    } else if (CMDEQ(cmd, "CHECKPOINT")) {
+        if (argc < 6) { fprintf(stderr, "CHECKPOINT requires <file> <name>\n"); close(fd); return 1; }
         const char *file = argv[4]; const char *name = argv[5];
         // LOOKUP for CHECKPOINT
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
@@ -857,8 +710,8 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send CHECKPOINT"); close(sfd); return 1; }
         char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) < 0) { perror("recv CHECKPOINT"); close(sfd); return 1; }
         print_human("SS", r); free(r); close(sfd); return 0;
-    } else if (strcmp(cmd, "list-checkpoints") == 0) {
-        if (argc < 5) { fprintf(stderr, "list-checkpoints requires <file>\n"); close(fd); return 1; }
+    } else if (CMDEQ(cmd, "LISTCHECKPOINTS")) {
+        if (argc < 5) { fprintf(stderr, "LISTCHECKPOINTS requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "LISTCHECKPOINTS", 0);
@@ -877,8 +730,8 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send LISTCHECKPOINTS"); close(sfd); return 1; }
         char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) < 0) { perror("recv LISTCHECKPOINTS"); close(sfd); return 1; }
         print_human("SS", r); free(r); close(sfd); return 0;
-    } else if (strcmp(cmd, "view-checkpoint") == 0) {
-        if (argc < 6) { fprintf(stderr, "view-checkpoint requires <file> <name>\n"); close(fd); return 1; }
+    } else if (CMDEQ(cmd, "VIEWCHECKPOINT")) {
+        if (argc < 6) { fprintf(stderr, "VIEWCHECKPOINT requires <file> <name>\n"); close(fd); return 1; }
         const char *file = argv[4]; const char *name = argv[5];
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "VIEWCHECKPOINT", 0);
@@ -897,27 +750,6 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         strncat(req, "}", sizeof(req) - strlen(req) - 1);
         if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send VIEWCHECKPOINT"); close(sfd); return 1; }
         char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) < 0) { perror("recv VIEWCHECKPOINT"); close(sfd); return 1; }
-        print_human("SS", r); free(r); close(sfd); return 0;
-    } else if (strcmp(cmd, "revertc") == 0) {
-        if (argc < 6) { fprintf(stderr, "revertc requires <file> <name>\n"); close(fd); return 1; }
-        const char *file = argv[4]; const char *name = argv[5];
-        json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
-        json_put_string_field(payload, sizeof(payload), "op", "REVERT", 0);
-        json_put_string_field(payload, sizeof(payload), "file", file, 0);
-        strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
-        if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
-        char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-        int dport=0; char ssaddr[64]={0}; char ticket[256]={0};
-        int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
-        free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
-        int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
-        char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "REVERT", 1);
-        json_put_string_field(req, sizeof(req), "file", file, 0);
-        json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
-        json_put_string_field(req, sizeof(req), "name", name, 0);
-        strncat(req, "}", sizeof(req) - strlen(req) - 1);
-        if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send REVERT"); close(sfd); return 1; }
-        char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) < 0) { perror("recv REVERT"); close(sfd); return 1; }
         print_human("SS", r); free(r); close(sfd); return 0;
     } else {
         fprintf(stderr, "Unknown command: %s\n", cmd);

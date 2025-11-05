@@ -256,30 +256,30 @@ static void *data_server_thread(void *arg) {
                         fprintf(stderr, "[SS] DELETE file=%s path=%s\n", file, path); fflush(stderr);
                         int ok = (unlink(path) == 0);
                         // Best-effort: remove undo snapshot
-                        char undopath[512]; snprintf(undopath, sizeof(undopath), "ss_data/undo/%s.undo", file);
+                        char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, file);
                         (void)unlink(undopath);
                         // Remove checkpoints folder for file
-                        char chkdir[512]; snprintf(chkdir, sizeof(chkdir), "ss_data/checkpoints/%s", file);
+                        char chkdir[SS_PATH_MAX]; snprintf(chkdir, sizeof(chkdir), "%s/checkpoints/%s", g_store_root, file);
                         DIR *cd = opendir(chkdir);
                         if (cd) {
-                            struct dirent *de; char entry[512];
+                            struct dirent *de; char entry[SS_PATH_MAX];
                             while ((de = readdir(cd)) != NULL) {
                                 if (strcmp(de->d_name, ".")==0 || strcmp(de->d_name, "..")==0) continue;
-                                snprintf(entry, sizeof(entry), "ss_data/checkpoints/%s/%s", file, de->d_name);
+                                snprintf(entry, sizeof(entry), "%s/checkpoints/%s/%s", g_store_root, file, de->d_name);
                                 (void)unlink(entry);
                             }
                             closedir(cd);
                             (void)rmdir(chkdir);
                         }
                         // Remove history snapshots for file
-                        char hdir[256]; snprintf(hdir, sizeof(hdir), "ss_data/history");
+                        char hdir[SS_PATH_MAX]; snprintf(hdir, sizeof(hdir), "%s/history", g_store_root);
                         DIR *hd = opendir(hdir);
                         if (hd) {
                             size_t flen = strlen(file); struct dirent *de;
                             while ((de = readdir(hd)) != NULL) {
                                 const char *name = de->d_name;
                                 if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                    char hp[512]; snprintf(hp, sizeof(hp), "ss_data/history/%s", name);
+                                    char hp[SS_PATH_MAX]; snprintf(hp, sizeof(hp), "%s/history/%s", g_store_root, name);
                                     (void)unlink(hp);
                                 }
                             }
