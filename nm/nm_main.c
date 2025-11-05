@@ -345,6 +345,7 @@ static void *client_thread(void *arg) {
             }
         } else if (strcmp(type, "CREATE") == 0) {
             char file[128]; char user[128]; user[0]='\0'; (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
+            int publicRead = 0, publicWrite = 0; (void)json_get_int_field(buf, "publicRead", &publicRead); (void)json_get_int_field(buf, "publicWrite", &publicWrite);
             if (json_get_string_field(buf, "file", file, sizeof(file)) != 0) {
                 const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {
@@ -367,6 +368,12 @@ static void *client_thread(void *arg) {
                             if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
                                 char *r = NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) == 0 && r) {
                                     if (strstr(r, "\"status\":\"OK\"")) { nm_dir_set(file, ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
+                                        if (publicRead || publicWrite) {
+                                            int anonPerm = 0;
+                                            if (publicWrite) anonPerm |= (ACL_R | ACL_W); // write implies read for anonymous
+                                            if (publicRead) anonPerm |= ACL_R;
+                                            if (anonPerm) nm_acl_grant(file, "anonymous", anonPerm);
+                                        }
                                         // choose a replica and replicate CREATE asynchronously
                                         int repls[4]; size_t nr=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *se=g_ss_list; se; se=se->next){ if (se->ss_id!=ssid && nr<4) repls[nr++]=se->ss_id; } pthread_mutex_unlock(&g_mu);
                                         if (nr>0) { nm_state_set_replicas(file, repls, 1); schedule_cmd_repl("CREATE", file, NULL, repls[0]); }
@@ -737,12 +744,30 @@ static void *client_thread(void *arg) {
             char user[128];
             if (json_get_string_field(buf, "user", user, sizeof(user)) == 0) {
                 printf("[NM] Client hello from user=%s\n", user);
-                nm_state_add_user(user);
+                if (nm_state_user_is_active(user)) {
+                    const char *er = "{\"status\":\"ERR_CONFLICT\",\"msg\":\"user-already-active\"}";
+                    send_msg(fd, er, (uint32_t)strlen(er));
+                    free(buf); close(fd); return NULL;
+                }
+                nm_state_set_user_active(user, 1);
             } else {
                 printf("[NM] Client hello (user unknown)\n");
             }
             const char *resp = "{\"status\":\"OK\"}";
             send_msg(fd, resp, (uint32_t)strlen(resp));
+        } else if (strcmp(type, "LOGOUT") == 0 || strcmp(type, "USER_SET_ACTIVE") == 0) {
+            char user[128]; int active = 0; user[0]='\0';
+            (void)json_get_string_field(buf, "user", user, sizeof(user));
+            if (strcmp(type, "USER_SET_ACTIVE") == 0) {
+                (void)json_get_int_field(buf, "active", &active);
+            } else {
+                active = 0; // LOGOUT means inactive
+            }
+            if (!user[0]) { const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                nm_state_set_user_active(user, active ? 1 : 0);
+                const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+            }
         } else if (strcmp(type, "LIST_SS") == 0) {
             // Debug endpoint to see registered SS
             pthread_mutex_lock(&g_mu);
@@ -815,8 +840,9 @@ static void *client_thread(void *arg) {
             char flags[32]; flags[0]='\0'; char user[128]; user[0]='\0';
             (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
             (void)json_get_string_field(buf, "flags", flags, sizeof(flags));
-            int all = (strstr(flags, "-a") != NULL);
-            int det = (strstr(flags, "-l") != NULL);
+            // Support -a, -l, and combined forms like -al or -la
+            int all = (strchr(flags, 'a') != NULL);
+            int det = (strchr(flags, 'l') != NULL);
             // Enumerate files
             char files[512][128]; int ssids[512]; size_t n = nm_state_get_dir(files, ssids, 512);
             char resp[16384]; size_t w=0;

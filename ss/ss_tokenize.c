@@ -179,6 +179,18 @@ int ss_tokens_replace_or_append(ss_doc_tokens_t *doc, int sidx, int widx, const 
     int wc = doc->word_counts[sidx];
     if (widx < 0 || widx > wc) return -1; // allow equal for append
     if (widx == wc) {
+        // Append mode; if appending a bare sentence delimiter, attach to previous word
+        size_t nl = strlen(new_word);
+        if (nl == 1 && is_sentence_end(new_word[0]) && wc > 0) {
+            char **row = doc->sent_words[sidx];
+            char *last = row[wc - 1];
+            size_t ln = strlen(last);
+            char *nw = (char *)realloc(last, ln + 2);
+            if (!nw) return -1;
+            nw[ln] = new_word[0]; nw[ln+1] = '\0';
+            row[wc - 1] = nw;
+            return 0;
+        }
         // append
         char **row = doc->sent_words[sidx];
         int newc = wc + 1;

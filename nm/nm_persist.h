@@ -15,6 +15,12 @@ int nm_state_save(const char *path);
 // Add a user to active sessions set; returns 1 if added, 0 if already existed
 int nm_state_add_user(const char *user);
 
+// Query whether a user is currently marked active (1) or not (0)
+int nm_state_user_is_active(const char *user);
+
+// Set a user's active status; if active=1 ensures user exists in users list. Returns 1 on change, 0 if unchanged
+int nm_state_set_user_active(const char *user, int active);
+
 // Snapshot users into caller-provided buffer of fixed-size strings
 // Returns number of users copied (<= max_users)
 size_t nm_state_get_users(char users[][128], size_t max_users);

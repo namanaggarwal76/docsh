@@ -2,6 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <termios.h>
+#include <ctype.h>
 
 #include "../common/net_proto.h"
 
@@ -23,6 +25,126 @@ static int tokenize(const char *line, char **outv, int maxv){
     return argc;
 }
 static void free_tokens(char **v, int n){ for(int i=0;i<n;i++) free(v[i]); }
+
+// Simple interactive line editor with history (TTY only)
+typedef struct {
+    char *items[200];
+    int count;
+} hist_t;
+
+static char *sdup(const char *s) {
+    if (!s) return NULL;
+    size_t n = strlen(s);
+    char *p = (char *)malloc(n + 1);
+    if (!p) return NULL;
+    memcpy(p, s, n + 1);
+    return p;
+}
+
+static void hist_add(hist_t *h, const char *line) {
+    if (!h || !line || !line[0]) return;
+    if (h->count > 0 && strcmp(h->items[h->count-1], line) == 0) return; // no dup of immediate previous
+    if (h->count >= (int)(sizeof(h->items)/sizeof(h->items[0]))) {
+        // drop oldest
+        free(h->items[0]);
+        memmove(&h->items[0], &h->items[1], (size_t)(h->count-1) * sizeof(h->items[0]));
+        h->count--;
+    }
+    h->items[h->count] = sdup(line);
+    if (h->items[h->count]) h->count++;
+}
+
+static int set_raw_mode(struct termios *orig) {
+    if (!isatty(STDIN_FILENO)) return 0;
+    if (tcgetattr(STDIN_FILENO, orig) != 0) return -1;
+    struct termios raw = *orig;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 1; raw.c_cc[VTIME] = 0;
+    if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) return -1;
+    return 0;
+}
+
+static void restore_mode(const struct termios *orig) {
+    if (!isatty(STDIN_FILENO)) return;
+    if (orig) (void)tcsetattr(STDIN_FILENO, TCSANOW, orig);
+}
+
+static void clear_line_and_prompt(const char *prompt, size_t prev_len) {
+    // Move to start, clear line, reprint prompt
+    (void)prev_len;
+    { ssize_t _wr = write(STDOUT_FILENO, "\r", 1); if (_wr < 0) {} }
+    // ANSI clear line
+    const char *clr = "\x1b[2K"; { ssize_t _wr = write(STDOUT_FILENO, clr, strlen(clr)); if (_wr < 0) {} }
+    if (prompt) { ssize_t _wr = write(STDOUT_FILENO, prompt, strlen(prompt)); if (_wr < 0) {} }
+}
+
+static int read_line_tty(const char *prompt, char *out, size_t out_sz, hist_t *hist) {
+    if (!out || out_sz == 0) return -1;
+    out[0] = '\0';
+    if (!isatty(STDIN_FILENO)) {
+        if (prompt) fputs(prompt, stdout), fflush(stdout);
+        return fgets(out, (int)out_sz, stdin) ? 0 : -1;
+    }
+    if (prompt) fputs(prompt, stdout), fflush(stdout);
+    struct termios orig; if (set_raw_mode(&orig) != 0) return -1;
+    char buf[2048]; size_t len = 0; buf[0] = '\0';
+    int browse = hist ? hist->count : 0; // browsing index: hist->count means new line
+    for (;;) {
+        char c;
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n <= 0) { restore_mode(&orig); return -1; }
+        if (c == '\r' || c == '\n') {
+            { ssize_t _wr = write(STDOUT_FILENO, "\n", 1); if (_wr < 0) {} }
+            break;
+        } else if ((unsigned char)c == 127 || c == '\b') {
+            if (len > 0) {
+                len--; buf[len] = '\0';
+                { ssize_t _wr = write(STDOUT_FILENO, "\b \b", 3); if (_wr < 0) {} }
+            }
+        } else if (c == 27) {
+            // Escape sequence
+            char seq[2];
+            if (read(STDIN_FILENO, &seq[0], 1) <= 0) continue;
+            if (read(STDIN_FILENO, &seq[1], 1) <= 0) continue;
+            if (seq[0] == '[') {
+                if (seq[1] == 'A' || seq[1] == 'B') { // Up or Down
+                    if (!hist || hist->count == 0) continue;
+                    if (seq[1] == 'A') { // Up
+                        if (browse > 0) browse--;
+                    } else { // Down
+                        if (browse < hist->count) browse++;
+                    }
+                    clear_line_and_prompt(prompt, len);
+                    if (browse >= 0 && browse < hist->count) {
+                        strncpy(buf, hist->items[browse], sizeof(buf) - 1);
+                        buf[sizeof(buf) - 1] = '\0'; len = strlen(buf);
+                        { ssize_t _wr = write(STDOUT_FILENO, buf, len); if (_wr < 0) {} }
+                    } else {
+                        buf[0] = '\0'; len = 0;
+                    }
+                }
+            }
+        } else if (isprint((unsigned char)c)) {
+            if (len + 1 < sizeof(buf)) {
+                buf[len++] = c; buf[len] = '\0';
+                { ssize_t _wr = write(STDOUT_FILENO, &c, 1); if (_wr < 0) {} }
+            }
+        } else {
+            // ignore other controls
+        }
+    }
+    restore_mode(&orig);
+    // copy out
+    {
+        size_t bl = strlen(buf);
+        if (bl >= out_sz) bl = out_sz - 1;
+        memcpy(out, buf, bl);
+        out[bl] = '\0';
+    }
+    // Add to history
+    if (hist) hist_add(hist, out);
+    return 0;
+}
 
 static void print_human(const char *who, const char *json) {
     if (!json) { fprintf(stderr, "%s: (no response)\n", who); return; }
@@ -193,14 +315,15 @@ int main(int argc, char **argv) {
     }
     printf("Welcome to Docs++ shell. Connected to %s:%u as %s. Type 'help' or 'exit'.\n", nm_host, (unsigned)nm_port, username);
     char line[2048];
+    hist_t hist = {0};
     for (;;) {
-        printf("docs> "); fflush(stdout);
-        if (!fgets(line, sizeof(line), stdin)) break;
+        char prompt[256]; snprintf(prompt, sizeof(prompt), "%s@docs> ", username[0]?username:"user");
+        if (read_line_tty(prompt, line, sizeof(line), &hist) != 0) break;
         rstrip(line);
         if (!line[0]) continue;
         if (strcmp(line, "exit")==0 || strcmp(line, "quit")==0) break;
         if (strcmp(line, "help")==0) {
-            printf("Commands: VIEW [-a] [-l] | READ <file> | CREATE <file> | WRITE <file> <sentenceIndex> | UNDO <file> | INFO <file> | DELETE <file> | STREAM <file> | LIST | ADDACCESS -R|-W <file> <user> | REMACCESS <file> <user> | REQUEST_ACCESS <file> [-R|-W] | VIEWREQUESTS <file> | APPROVE_ACCESS <file> -R|-W <user> | DENY_ACCESS <file> <user> | STATS | EXEC <file>\n");
+            printf("Commands: VIEW [-a] [-l] | READ <file> | CREATE <file> [-r] [-w] | WRITE <file> <sentenceIndex> | UNDO <file> | INFO <file> | DELETE <file> | STREAM <file> | LIST | ADDACCESS -R|-W <file> <user> | REMACCESS <file> <user> | REQUEST_ACCESS <file> [-R|-W] | VIEWREQUESTS <file> | APPROVE_ACCESS <file> -R|-W <user> | DENY_ACCESS <file> <user> | STATS | EXEC <file>\n");
             continue;
         }
         // Tokenize
@@ -212,6 +335,12 @@ int main(int argc, char **argv) {
         for (int i=0;i<tn && ac<70;i++) argv2[ac++] = tokv[i];
         (void)client_handle_oneshot(ac, argv2, username);
         free_tokens(tokv, tn);
+    }
+    // On exit, try to notify NM to mark this user inactive
+    int lfd = tcp_connect(nm_host, nm_port);
+    if (lfd >= 0) {
+        char bye[256]; bye[0]='\0'; json_put_string_field(bye, sizeof(bye), "type", "LOGOUT", 1); json_put_string_field(bye, sizeof(bye), "user", username, 0); strncat(bye, "}", sizeof(bye)-strlen(bye)-1);
+        (void)send_msg(lfd, bye, (uint32_t)strlen(bye)); char *br=NULL; uint32_t bl=0; (void)recv_msg(lfd, &br, &bl); if (br) free(br); close(lfd);
     }
     return 0;
 }
@@ -363,11 +492,18 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         free(r2); close(sfd);
         return 0;
     } else if (strcmp(cmd, "create") == 0 || strcmp(cmd, "CREATE") == 0) {
-        if (argc < 5) { fprintf(stderr, "create requires <file>\n"); close(fd); return 1; }
+        if (argc < 5) { fprintf(stderr, "create requires <file> [-r] [-w]\n"); close(fd); return 1; }
         const char *file = argv[4];
+        int pubR = 0, pubW = 0;
+        for (int i = 5; i < argc; ++i) {
+            if (strcmp(argv[i], "-r") == 0) pubR = 1;
+            else if (strcmp(argv[i], "-w") == 0) pubW = 1;
+        }
         json_put_string_field(payload, sizeof(payload), "type", "CREATE", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
+        if (pubR) json_put_int_field(payload, sizeof(payload), "publicRead", 1, 0);
+        if (pubW) json_put_int_field(payload, sizeof(payload), "publicWrite", 1, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
     } else if (strcmp(cmd, "delete") == 0 || strcmp(cmd, "DELETE") == 0) {
         if (argc < 5) { fprintf(stderr, "delete requires <file>\n"); close(fd); return 1; }

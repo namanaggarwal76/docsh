@@ -14,6 +14,10 @@ typedef struct {
     char **users;
     size_t n_users;
     size_t cap_users;
+    // Active users (logged-in)
+    char **active_users;
+    size_t n_active;
+    size_t cap_active;
     struct dir_entry { char *file; int ss_id; int *replicas; size_t n_repl; size_t cap_repl; } *dir;
     size_t n_dir;
     size_t cap_dir;
@@ -51,6 +55,16 @@ static void ensure_user_cap(size_t need) {
     g_state.cap_users = newcap;
 }
 
+static void ensure_active_cap(size_t need) {
+    if (g_state.cap_active >= need) return;
+    size_t newcap = g_state.cap_active ? g_state.cap_active * 2 : 8;
+    while (newcap < need) newcap *= 2;
+    char **p = (char **)realloc(g_state.active_users, newcap * sizeof(char *));
+    if (!p) return; // OOM ignore
+    g_state.active_users = p;
+    g_state.cap_active = newcap;
+}
+
 void nm_state_init(void) {
     memset(&g_state, 0, sizeof(g_state));
 }
@@ -77,6 +91,39 @@ size_t nm_state_get_users(char users[][128], size_t max_users) {
     return c;
 }
 
+int nm_state_user_is_active(const char *user) {
+    if (!user || !*user) return 0;
+    for (size_t i = 0; i < g_state.n_active; ++i) {
+        if (strcmp(g_state.active_users[i], user) == 0) return 1;
+    }
+    return 0;
+}
+
+int nm_state_set_user_active(const char *user, int active) {
+    if (!user || !*user) return 0;
+    // Ensure it's a known user when activating
+    if (active) nm_state_add_user(user);
+    // Look for existing in active list
+    for (size_t i = 0; i < g_state.n_active; ++i) {
+        if (strcmp(g_state.active_users[i], user) == 0) {
+            if (active) return 0; // already active
+            // deactivate: remove by swap-with-last
+            free(g_state.active_users[i]);
+            if (i + 1 < g_state.n_active) g_state.active_users[i] = g_state.active_users[g_state.n_active - 1];
+            g_state.n_active--;
+            return 1;
+        }
+    }
+    if (!active) return 0; // already inactive
+    // add to active
+    ensure_active_cap(g_state.n_active + 1);
+    if (g_state.cap_active < g_state.n_active + 1) return 0;
+    g_state.active_users[g_state.n_active] = strdup(user);
+    if (!g_state.active_users[g_state.n_active]) return 0;
+    g_state.n_active++;
+    return 1;
+}
+
 static int write_atomic(const char *path, const char *data, size_t len) {
     char tmppath[512];
     snprintf(tmppath, sizeof(tmppath), "%s.tmp.%d", path, (int)getpid());
@@ -94,7 +141,7 @@ static int write_atomic(const char *path, const char *data, size_t len) {
 
 int nm_state_save(const char *path) {
     // Compose JSON: users, directory, acls, replicas, requests, folders
-    size_t bufcap = 8192 + g_state.n_users * 64 + g_state.n_dir * 160 + g_state.n_acls * 320 + g_state.n_folders * 64;
+    size_t bufcap = 8192 + (g_state.n_users + g_state.n_active) * 64 + g_state.n_dir * 160 + g_state.n_acls * 320 + g_state.n_folders * 64;
     char *buf = (char *)malloc(bufcap);
     if (!buf) return -1;
     buf[0] = '\0';
@@ -111,6 +158,14 @@ int nm_state_save(const char *path) {
             char ch[2] = {*s, 0};
             strncat(buf, ch, bufcap - strlen(buf) - 1);
         }
+        strcat(buf, "\"");
+    }
+    strcat(buf, "],\n  \"active\":[");
+    for (size_t i = 0; i < g_state.n_active; ++i) {
+        if (i) strcat(buf, ",");
+        strcat(buf, "\"");
+        const char *s = g_state.active_users[i];
+        for (; *s; ++s) { if (*s == '"' || *s == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1); }
         strcat(buf, "\"");
     }
     strcat(buf, "],\n  \"directory\":{");
@@ -228,6 +283,31 @@ static void parse_users_array(const char *json) {
     }
 }
 
+static void parse_active_array(const char *json) {
+    const char *p = strstr(json, "\"active\"");
+    if (!p) return;
+    p = strchr(p, '[');
+    if (!p) return;
+    p++;
+    while (*p) {
+        while (*p == ' ' || *p == '\n' || *p == '\t' || *p == ',') p++;
+        if (*p == ']') break;
+        if (*p != '"') break;
+        p++;
+        const char *start = p;
+        while (*p && *p != '"') { if (*p == '\\' && p[1]) p += 2; else p++; }
+        size_t len = (size_t)(p - start);
+        char tmp[256]; if (len >= sizeof(tmp)) len = sizeof(tmp) - 1;
+        size_t j = 0; const char *s = start;
+        while (j < len && *s) { if (*s == '\\' && s[1]) { s++; tmp[j++] = *s++; } else { tmp[j++] = *s++; } }
+        tmp[j] = '\0';
+        nm_state_set_user_active(tmp, 1);
+        if (*p == '"') p++;
+        while (*p && *p != ',' && *p != ']') p++;
+        if (*p == ',') p++;
+    }
+}
+
 static void parse_directory_object(const char *json) {
     const char *p = strstr(json, "\"directory\"");
     if (!p) return;
@@ -284,6 +364,7 @@ int nm_state_load(const char *path) {
     fclose(f);
     buf[n] = '\0';
     parse_users_array(buf);
+    parse_active_array(buf);
     parse_directory_object(buf);
     // Parse acls
     const char *p = strstr(buf, "\"acls\"");
