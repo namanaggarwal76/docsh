@@ -17,14 +17,6 @@ static char *str_dup_range(const char *s, size_t n) {
     return p;
 }
 
-static char *str_dup_c(const char *s) {
-    if (!s) return NULL;
-    size_t n = strlen(s);
-    char *p = (char *)malloc(n + 1);
-    if (!p) return NULL;
-    memcpy(p, s, n + 1);
-    return p;
-}
 
 int ss_tokenize(const char *text, ss_doc_tokens_t *out) {
     if (!text || !out) return -1;
@@ -174,42 +166,89 @@ oom:
 }
 
 int ss_tokens_replace_or_append(ss_doc_tokens_t *doc, int sidx, int widx, const char *new_word) {
+    // New semantics: insert before index widx (0-based), or append if widx==wc.
+    // Content may contain multiple whitespace-separated tokens; all are inserted in order.
     if (!doc || !new_word) return -1;
     if (sidx < 0 || sidx >= doc->num_sentences) return -1;
     int wc = doc->word_counts[sidx];
-    if (widx < 0 || widx > wc) return -1; // allow equal for append
-    if (widx == wc) {
-        // Append mode; if appending a bare sentence delimiter, attach to previous word
-        size_t nl = strlen(new_word);
-        if (nl == 1 && is_sentence_end(new_word[0]) && wc > 0) {
-            char **row = doc->sent_words[sidx];
-            char *last = row[wc - 1];
-            size_t ln = strlen(last);
-            char *nw = (char *)realloc(last, ln + 2);
-            if (!nw) return -1;
-            nw[ln] = new_word[0]; nw[ln+1] = '\0';
-            row[wc - 1] = nw;
-            return 0;
-        }
-        // append
+    if (widx < 0) return -1;
+
+    // Split new_word on whitespace into tokens
+    // Count tokens first
+    int ntok = 0; const char *p = new_word;
+    while (*p) {
+        while (*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && !(*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
+        if (p>start) ntok++;
+    }
+    if (ntok == 0) return -1;
+
+    // Special-case: single bare sentence delimiter on append => attach to previous token
+    if (widx >= wc && ntok == 1 && strlen(new_word) == 1 && is_sentence_end(new_word[0]) && wc > 0) {
         char **row = doc->sent_words[sidx];
-        int newc = wc + 1;
-        char **nw = (char **)realloc(row, (size_t)newc * sizeof(char *));
+        char *last = row[wc - 1];
+        size_t ln = strlen(last);
+        char *nw = (char *)realloc(last, ln + 2);
         if (!nw) return -1;
-        nw[wc] = str_dup_c(new_word);
-        if (!nw[wc]) return -1;
-        doc->sent_words[sidx] = nw;
-        doc->word_counts[sidx] = newc;
-        return 0;
-    } else {
-        // replace
-        char **row = doc->sent_words[sidx];
-        char *rep = str_dup_c(new_word);
-        if (!rep) return -1;
-        free(row[widx]);
-        row[widx] = rep;
+        nw[ln] = new_word[0]; nw[ln+1] = '\0';
+        row[wc - 1] = nw;
         return 0;
     }
+    // Determine insertion index with punctuation-aware semantics
+    int ins_idx = widx;
+    if (widx > wc) {
+        // allow wc+1 only if last token ends with sentence delimiter
+        if (!(wc > 0)) return -1;
+        char **row = doc->sent_words[sidx];
+        char *last = row[wc - 1]; size_t ln = strlen(last);
+        if (ln == 0 || !is_sentence_end(last[ln-1]) || widx != wc + 1) return -1;
+        ins_idx = wc - 1; // insert before last token
+    } else if (widx == wc) {
+        // If last token ends with delimiter and we're inserting words (not bare delimiter), insert before last
+        if (wc > 0) {
+            char **row = doc->sent_words[sidx];
+            char *last = row[wc - 1]; size_t ln = strlen(last);
+            if (ln > 0 && is_sentence_end(last[ln-1])) {
+                ins_idx = wc - 1; // before last, to keep punctuation at end
+            }
+        }
+    }
+
+    // Build array of duplicated tokens
+    char **ins = (char **)calloc((size_t)ntok, sizeof(char *));
+    if (!ins) return -1;
+    p = new_word; int k = 0;
+    while (*p && k < ntok) {
+        while (*p==' '||*p=='\t'||*p=='\n'||*p=='\r') p++;
+        if (!*p) break;
+        const char *start = p;
+        while (*p && !(*p==' '||*p=='\t'||*p=='\n'||*p=='\r')) p++;
+        size_t n = (size_t)(p - start);
+        char *dup = str_dup_range(start, n);
+        if (!dup) { for (int i=0;i<k;i++) free(ins[i]); free(ins); return -1; }
+        ins[k++] = dup;
+    }
+
+    // Allocate new row with spliced tokens
+    char **row = doc->sent_words[sidx];
+    int newc = wc + ntok;
+    char **nr = (char **)malloc((size_t)newc * sizeof(char *));
+    if (!nr) { for (int i=0;i<ntok;i++) free(ins[i]); free(ins); return -1; }
+    // copy left part [0..widx-1]
+    for (int i=0;i<ins_idx;i++) nr[i] = row[i];
+    // insert tokens
+    for (int i=0;i<ntok;i++) nr[ins_idx + i] = ins[i];
+    // copy right part
+    for (int i=ins_idx;i<wc;i++) nr[ntok + i] = row[i];
+
+    // replace row
+    free(row);
+    doc->sent_words[sidx] = nr;
+    doc->word_counts[sidx] = newc;
+    free(ins); // keep dup strings in nr
+    return 0;
 }
 
 char *ss_tokens_compose(const ss_doc_tokens_t *doc) {

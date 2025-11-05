@@ -1,8 +1,9 @@
 {
-  "users":["alice","naman"],
-  "directory":{"report.txt":1,"demo.txt":1,"udtest.txt":1,"test.txt":1,"mouse.txt":1,"new.txt":1,"helo.sh":1},
-  "acls":{"udtest.txt":{"owner":"owner","grants":{"anonymous":"RW"}},"test.txt":{"owner":"naman","grants":{"naman":"RW"}},"mouse.txt":{"owner":"naman","grants":{"naman":"RW"}},"new.txt":{"owner":"naman","grants":{"naman":"RW"}},"helo.sh":{"owner":"naman","grants":{"naman":"RW"}}},
-  "replicas":{"report.txt":[],"demo.txt":[],"udtest.txt":[],"test.txt":[1],"mouse.txt":[1],"new.txt":[1],"helo.sh":[1]},
+  "users":["alice","naman","manav"],
+  "active":["manav","naman"],
+  "directory":{"report.txt":1,"demo.txt":1,"udtest.txt":1,"test.txt":1,"mouse.txt":1,"new.txt":1,"helo.sh":1,"f1.txt":1,"f2.txt":1},
+  "acls":{"udtest.txt":{"owner":"owner","grants":{"anonymous":"RW"}},"f2.txt":{"owner":"manav","grants":{"manav":"RW"}}},
+  "replicas":{"report.txt":[],"demo.txt":[],"udtest.txt":[],"test.txt":[1],"mouse.txt":[1],"new.txt":[1],"helo.sh":[1],"f1.txt":[],"f2.txt":[]},
   "requests":{},
   "folders":[]
 }

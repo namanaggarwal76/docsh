@@ -181,6 +181,28 @@ static void print_human(const char *who, const char *json) {
             if (count==0) printf("(none)\n");
             return;
         }
+        // LIST_USERS: users list (active users)
+        if (strstr(json, "\"users\":[]") || strstr(json, "\"users\": [") || strstr(json, "\"users\":\"")) {
+            const char *p = strstr(json, "\"users\":");
+            if (!p) { printf("ok\n"); return; }
+            p = strchr(p, '[');
+            if (!p) { printf("ok\n"); return; }
+            p++;
+            int count = 0;
+            while (*p && *p != ']') {
+                while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                if (*p == '"') {
+                    p++; const char *s = p; while (*p && *p != '"') p++; size_t n = (size_t)(p - s);
+                    char name[256]; if (n >= sizeof(name)) n = sizeof(name)-1; memcpy(name, s, n); name[n] = '\0';
+                    printf("%s\n", name);
+                    count++;
+                    if (*p == '"') p++;
+                } else break;
+            }
+            // print final ok as requested
+            printf("ok\n");
+            return;
+        }
         // STATS summary
         if (strstr(json, "\"replicationQueue\":")) {
             int files=0, locks=0, rq=0;
@@ -322,8 +344,14 @@ int main(int argc, char **argv) {
         rstrip(line);
         if (!line[0]) continue;
         if (strcmp(line, "exit")==0 || strcmp(line, "quit")==0) break;
+        if (strcmp(line, "clear")==0 || strcmp(line, "CLEAR")==0) {
+            // Clear screen like terminal 'clear'
+            fputs("\x1b[2J\x1b[H", stdout);
+            fflush(stdout);
+            continue;
+        }
         if (strcmp(line, "help")==0) {
-            printf("Commands: VIEW [-a] [-l] | READ <file> | CREATE <file> [-r] [-w] | WRITE <file> <sentenceIndex> | UNDO <file> | INFO <file> | DELETE <file> | STREAM <file> | LIST | ADDACCESS -R|-W <file> <user> | REMACCESS <file> <user> | REQUEST_ACCESS <file> [-R|-W] | VIEWREQUESTS <file> | APPROVE_ACCESS <file> -R|-W <user> | DENY_ACCESS <file> <user> | STATS | EXEC <file>\n");
+            printf("Commands: VIEW [-a] [-l] | READ <file> | CREATE <file> [-r] [-w] | WRITE <file> <sentenceIndex> | UNDO <file> | INFO <file> | DELETE <file> | STREAM <file> | LIST | ADDACCESS -R|-W <file> <user> | REMACCESS <file> <user> | REQUEST_ACCESS <file> [-R|-W] | VIEWREQUESTS <file> | APPROVE_ACCESS <file> -R|-W <user> | DENY_ACCESS <file> <user> | STATS | EXEC <file> | CLEAR\n");
             continue;
         }
         // Tokenize
@@ -351,6 +379,12 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
     uint16_t nm_port = (uint16_t)atoi(argv[2]);
     const char *cmd = argv[3];
     int fd = tcp_connect(nm_host, nm_port);
+    if (strcmp(cmd, "CLEAR") == 0 || strcmp(cmd, "clear") == 0) {
+        if (fd >= 0) close(fd);
+        fputs("\x1b[2J\x1b[H", stdout);
+        fflush(stdout);
+        return 0;
+    }
     if (fd < 0) { perror("connect NM"); return 1; }
 
     char payload[512]; payload[0] = '\0';
@@ -635,7 +669,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send PUT"); close(sfd); return 1; }
         char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) < 0) { perror("recv PUT"); close(sfd); return 1; }
         printf("[CLI] SS response: %.*s\n", rl, r?r:""); free(r); close(sfd); return 0;
-    } else if (strcmp(cmd, "undo") == 0) {
+    } else if (strcmp(cmd, "undo") == 0 || strcmp(cmd, "UNDO") == 0) {
         if (argc < 5) { fprintf(stderr, "undo requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];
         // LOOKUP for UNDO

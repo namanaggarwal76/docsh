@@ -25,6 +25,10 @@ int nm_state_set_user_active(const char *user, int active);
 // Returns number of users copied (<= max_users)
 size_t nm_state_get_users(char users[][128], size_t max_users);
 
+// Snapshot active (logged-in) users into caller-provided buffer of fixed-size strings
+// Returns number of active users copied (<= max_users)
+size_t nm_state_get_active_users(char users[][128], size_t max_users);
+
 // Directory mapping persistence (file -> ssId)
 // Upsert a mapping; returns 1 if added or changed, 0 if unchanged
 int nm_state_set_dir(const char *file, int ss_id);
@@ -65,6 +69,9 @@ int nm_acl_grant(const char *file, const char *user, int perm);
 // Remove all permissions for a user on a file
 int nm_acl_revoke(const char *file, const char *user);
 
+// Remove ACL entry entirely for a file (owner and all grants)
+int nm_acl_delete(const char *file);
+
 // Check if user is allowed for op ("READ" requires R, "WRITE"/"UNDO" require W). Owner is always allowed.
 int nm_acl_check(const char *file, const char *user, const char *op);
 
@@ -101,5 +108,8 @@ size_t nm_state_list_requests(const char *file, char users[][128], size_t max_us
 
 // Remove a pending request for file by username; returns 1 if removed, 0 if not present
 int nm_state_remove_request(const char *file, const char *user);
+
+// Remove all pending requests for a file
+int nm_state_clear_requests_for(const char *file);
 
 #endif // NM_PERSIST_H

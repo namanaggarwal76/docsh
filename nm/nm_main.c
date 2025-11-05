@@ -401,7 +401,9 @@ static void *client_thread(void *arg) {
                 if (nm_state_find_dir(file, &ssid) != 0) {
                     const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
                 } else {
-                    if (nm_acl_check(file, user, "WRITE") != 0) {
+                        // Owner-only delete: require requester to be the owner
+                        char owner[128]; owner[0]='\0';
+                        if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) {
                         const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
                     } else {
                         pthread_mutex_lock(&g_mu);
@@ -424,6 +426,9 @@ static void *client_thread(void *arg) {
                                     if (recv_msg(sfd, &r, &rl) == 0 && r) {
                                         if (strstr(r, "\"status\":\"OK\"")) {
                                             nm_dir_del(file);
+                                                // Clean up ACLs and pending requests for the deleted file
+                                                nm_acl_delete(file);
+                                                nm_state_clear_requests_for(file);
                                             // replicate delete to replicas
                                             int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
                                             for (size_t i=0;i<nr;i++) schedule_cmd_repl("DELETE", file, NULL, repls[i]);
@@ -795,7 +800,8 @@ static void *client_thread(void *arg) {
             pthread_mutex_unlock(&g_mu);
             send_msg(fd, resp, (uint32_t)strlen(resp));
         } else if (strcmp(type, "LIST_USERS") == 0) {
-            char users[256][128]; size_t n = nm_state_get_users(users, 256);
+            // Return only active users (logged-in)
+            char users[256][128]; size_t n = nm_state_get_active_users(users, 256);
             char resp[4096]; size_t w = 0; w += snprintf(resp + w, sizeof(resp) - w, "{\"status\":\"OK\",\"users\":[");
             for (size_t i = 0; i < n; ++i) {
                 if (i) w += snprintf(resp + w, sizeof(resp) - w, ",");
