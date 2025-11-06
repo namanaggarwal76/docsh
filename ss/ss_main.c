@@ -288,6 +288,20 @@ static void *data_server_thread(void *arg) {
                         if (ok) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     } else { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                } else if (strcmp(type, "CREATEFOLDER") == 0) {
+                    // Create a folder inside files/ for this SS
+                    char pathrel[256];
+                    if (json_get_string_field(buf, "path", pathrel, sizeof(pathrel)) != 0 || !pathrel[0]) {
+                        const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                    } else {
+                        char dirpath[SS_PATH_MAX];
+                        snprintf(dirpath, sizeof(dirpath), "%s/files/%s", g_store_root, pathrel);
+                        // Create parent dirs, then the final folder
+                        ensure_parent_dirs_for(dirpath);
+                        int rc = mkdir(dirpath, 0755);
+                        if (rc != 0 && errno != EEXIST) { perror("[SS] mkdir CREATEFOLDER"); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                        else { const char *ok = "{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
+                    }
                 } else if (strcmp(type, "BEGIN_WRITE") == 0) {
                     char file[128]; int sidx = 0; // default to 0 if absent
                     int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
@@ -613,6 +627,14 @@ static void *data_server_thread(void *arg) {
                             char u_new[SS_PATH_MAX]; snprintf(u_new, sizeof(u_new), "%s/undo/%s.undo", g_store_root, nfile);
                             ensure_parent_dirs_for(u_new);
                             if (stat(u_old, &st) == 0) { (void)rename(u_old, u_new); }
+                            // Rename checkpoints directory if present
+                            char c_old[SS_PATH_MAX]; snprintf(c_old, sizeof(c_old), "%s/checkpoints/%s", g_store_root, file);
+                            char c_new[SS_PATH_MAX]; snprintf(c_new, sizeof(c_new), "%s/checkpoints/%s", g_store_root, nfile);
+                            if (stat(c_old, &st) == 0) {
+                                ensure_parent_dirs_for(c_new);
+                                // Attempt directory rename (will move the folder atomically within same filesystem)
+                                (void)rename(c_old, c_new);
+                            }
                             // Rename history snapshots
                             char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
                             DIR *d = opendir(dpath);
@@ -676,7 +698,7 @@ static void *data_server_thread(void *arg) {
                     int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
                     int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
                     if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0 && ticket_validate(ticket, file, "WRITE", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
                         char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         struct stat st;

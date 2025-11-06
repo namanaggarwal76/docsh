@@ -5,7 +5,7 @@
 #include <termios.h>
 #include <ctype.h>
 #include <strings.h>
-
+#include <time.h>
 #include "../common/net_proto.h"
 
 // Forward declaration for reuse in REPL
@@ -150,6 +150,16 @@ static int read_line_tty(const char *prompt, char *out, size_t out_sz, hist_t *h
     return 0;
 }
 
+// Format epoch seconds to human-readable local time string
+static void format_time_hr(int t, char *out, size_t out_sz) {
+    if (!out || out_sz == 0) return;
+    if (t <= 0) { snprintf(out, out_sz, "-"); return; }
+    time_t tt = (time_t)t;
+    struct tm *ptm = localtime(&tt);
+    if (!ptm) { snprintf(out, out_sz, "%d", t); return; }
+    strftime(out, out_sz, "%Y-%m-%d %H:%M:%S", ptm);
+}
+
 static void print_human(const char *who, const char *json) {
     if (!json) { fprintf(stderr, "%s: (no response)\n", who); return; }
     char status[64]; status[0]='\0';
@@ -168,25 +178,52 @@ static void print_human(const char *who, const char *json) {
             return;
         }
         // VIEWREQUESTS: requests list
-        if (strstr(json, "\"requests\":[")) {
+        if (strstr(json, "\"requests\":")) {
             printf("Requests:\n");
             const char *p = strstr(json, "["); if (!p) { printf("(none)\n"); return; }
             p++;
             int count = 0;
             while (*p && *p!=']') {
                 while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
-                if (*p=='"') {
+                if (*p=='{') {
+                    p++;
+                    char name[256] = {0}; char mode = 'R';
+                    while (*p && *p!='}') {
+                        while(*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                        if (*p=='"') {
+                            p++; const char *k=p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
+                            size_t klen=(size_t)(p-k); char key[16]; size_t ki=0; const char *ks=k; while(ki<klen&&*ks){ if(*ks=='\\'&&ks[1]){ks++; key[ki++]=*ks++;} else key[ki++]=*ks++; } key[ki]='\0'; if (*p=='"') p++;
+                            while(*p && *p!=':') p++;
+                            if (*p==':') p++;
+                            while(*p==' '||*p=='\n'||*p=='\t') p++;
+                            if (strcmp(key, "user")==0 && *p=='"') {
+                                p++; const char *s=p; while(*p && *p!='"') p++; size_t n=(size_t)(p-s); if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0'; if (*p=='"') p++;
+                            } else if (strcmp(key, "mode")==0 && *p=='"') {
+                                p++; if (*p=='W' || *p=='R') mode=*p; while(*p && *p!='"') p++; if (*p=='"') p++;
+                            } else {
+                                while(*p && *p!=',' && *p!='}') p++;
+                            }
+                        } else { while(*p && *p!=',' && *p!='}') p++; }
+                        if (*p==',') p++;
+                    }
+                    if (*p=='}') p++;
+                    printf("- %s (%c)\n", name[0]?name:"?", mode);
+                    count++;
+                } else if (*p=='"') {
+                    // Backward compat: username string only
                     p++; const char *s=p; while(*p && *p!='"') p++; size_t n=(size_t)(p-s);
                     char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0';
-                    printf("- %s\n", name); count++;
                     if (*p=='"') p++;
+                    printf("- %s (R)\n", name);
+                    count++;
                 } else break;
             }
             if (count==0) printf("(none)\n");
             return;
         }
-        // LIST_USERS: users list (active users)
-        if (strstr(json, "\"users\":[]") || strstr(json, "\"users\": [") || strstr(json, "\"users\":\"")) {
+    // LIST_USERS: users list (active users)
+    // Match any users array shape, e.g., "users":[...] with or without spaces
+    if (strstr(json, "\"users\":[")) {
             const char *p = strstr(json, "\"users\":");
             if (!p) { printf("ok\n"); return; }
             p = strchr(p, '[');
@@ -218,7 +255,21 @@ static void print_human(const char *who, const char *json) {
         }
         // LISTCHECKPOINTS: checkpoints list
         if (strstr(json, "\"checkpoints\":")) {
-            printf("OK: checkpoints listed\n");
+            const char *p = strstr(json, "[");
+            if (!p) { printf("(no checkpoints)\n"); return; }
+            p++;
+            int count = 0;
+            while (*p && *p != ']') {
+                while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                if (*p=='"') {
+                    p++; const char *s=p; while(*p && *p!='"') p++; size_t n=(size_t)(p-s);
+                    char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0';
+                    if (*p=='"') p++;
+                    printf("- %s\n", name);
+                    count++;
+                } else break;
+            }
+            if (count == 0) printf("(no checkpoints)\n");
             return;
         }
         // EXEC output
@@ -240,14 +291,17 @@ static void print_human(const char *who, const char *json) {
             (void)json_get_int_field(json, "mtime", &mtime);
             (void)json_get_int_field(json, "atime", &atime);
             if (got) {
+                char mtime_s[32], atime_s[32];
+                format_time_hr(mtime, mtime_s, sizeof(mtime_s));
+                format_time_hr(atime, atime_s, sizeof(atime_s));
                 printf("--> File: %s\n", fname);
                 printf("--> Owner: %s\n", owner[0]?owner:"-");
-                printf("--> Created: %d\n", mtime);
-                printf("--> Last Modified: %d\n", mtime);
+                printf("--> Created: %s\n", mtime_s);
+                printf("--> Last Modified: %s\n", mtime_s);
                 printf("--> Size: %d bytes\n", size);
                 printf("--> Access: ");
                 char acc[1024]; if (json_get_string_field(json, "access", acc, sizeof(acc))==0) printf("%s\n", acc); else printf("-\n");
-                printf("--> Last Accessed: %d\n", atime);
+                printf("--> Last Accessed: %s\n", atime_s);
                 return;
             }
         }
@@ -284,8 +338,9 @@ static void print_human(const char *who, const char *json) {
                 (void)json_get_int_field(p, "words", &words);
                 (void)json_get_int_field(p, "chars", &chars);
                 (void)json_get_int_field(p, "atime", &atime);
-                // print row; time as epoch for simplicity
-                printf("| %-10s | %5d | %5d | %16d | %-5s |\n", name, words, chars, atime, owner[0]?owner:"-");
+                char atime_s[32]; format_time_hr(atime, atime_s, sizeof(atime_s));
+                // print row with human-readable time
+                printf("| %-10s | %5d | %5d | %16s | %-5s |\n", name, words, chars, atime_s, owner[0]?owner:"-");
                 while (*p && *p!='}') p++;
                 if (*p=='}') p++;
                 while (*p && *p!=',' && *p!=']') p++;
@@ -377,7 +432,7 @@ int main(int argc, char **argv) {
             printf("  CHECKPOINT <file> <name>\n");
             printf("  VIEWCHECKPOINT <file> <name>\n");
             printf("  LISTCHECKPOINTS <file>\n");
-            printf("  REVERT <file> <version|checkpointName>\n");
+            printf("  REVERT <file> <checkpoint_tag>\n");
             printf("  CLEAR | EXIT\n");
             continue;
         }
@@ -601,7 +656,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         free(r2); close(sfd);
         return 0;
     } else if (CMDEQ(cmd, "REVERT")) {
-        if (argc < 6) { fprintf(stderr, "revert requires <file> <version|checkpointName>\n"); close(fd); return 1; }
+        if (argc < 6) { fprintf(stderr, "revert requires <file> <checkpoint_tag>\n"); close(fd); return 1; }
         const char *file = argv[4]; const char *ver_or_name = argv[5];
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "REVERT", 0);
@@ -619,13 +674,8 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         char req[256]; req[0] = '\0';
         json_put_string_field(req, sizeof(req), "type", "REVERT", 1);
         json_put_string_field(req, sizeof(req), "file", file, 0);
-        // Accept either a numeric version or a checkpoint name
-        int is_num = 1; for (const char *p = ver_or_name; *p; ++p) { if (!isdigit((unsigned char)*p)) { is_num = 0; break; } }
-        if (is_num) {
-            json_put_int_field(req, sizeof(req), "version", atoi(ver_or_name), 0);
-        } else {
-            json_put_string_field(req, sizeof(req), "name", ver_or_name, 0);
-        }
+        // Always treat second argument as checkpoint tag
+        json_put_string_field(req, sizeof(req), "name", ver_or_name, 0);
         json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
         strncat(req, "}", sizeof(req) - strlen(req) - 1);
         if (send_msg(sfd, req, (uint32_t)strlen(req)) < 0) { perror("send REVERT"); close(sfd); return 1; }
@@ -716,6 +766,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "LISTCHECKPOINTS", 0);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
@@ -736,6 +787,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "type", "LOOKUP", 1);
         json_put_string_field(payload, sizeof(payload), "op", "VIEWCHECKPOINT", 0);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
+        json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }

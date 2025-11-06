@@ -100,11 +100,12 @@ int nm_state_move_folder_prefix(const char *old_path, const char *new_path,
 								char files[][128], char new_files[][128], int ssids[], size_t max_files);
 
 // --- Access Requests (bonus) ---
-// Add a pending access request for file by username; returns 1 if added, 0 if already present or file unknown
-int nm_state_add_request(const char *file, const char *user);
+// Add a pending access request for file by username with mode ('R' or 'W');
+// returns 1 if added, 0 if already present or file unknown
+int nm_state_add_request(const char *file, const char *user, char mode);
 
-// List pending requests for file into users array; returns count
-size_t nm_state_list_requests(const char *file, char users[][128], size_t max_users);
+// List pending requests for file into users array and modes array; returns count
+size_t nm_state_list_requests(const char *file, char users[][128], char modes[], size_t max_users);
 
 // Remove a pending request for file by username; returns 1 if removed, 0 if not present
 int nm_state_remove_request(const char *file, const char *user);

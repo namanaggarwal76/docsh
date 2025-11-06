@@ -643,8 +643,32 @@ static void *client_thread(void *arg) {
             if (json_get_string_field(buf, "path", path, sizeof(path)) != 0) {
                 const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {
+                // Persist logical folder in state
                 nm_state_add_folder(path);
                 (void)nm_state_save("nm_state.json");
+                // Also create the folder physically on the primary SS (prefer ss1 if present)
+                int data_port = 0;
+                pthread_mutex_lock(&g_mu);
+                // Prefer SS id 1 if registered
+                for (ss_entry_t *e = g_ss_list; e; e = e->next) {
+                    if (e->ss_id == 1 && e->is_up) { data_port = e->ss_data_port; break; }
+                }
+                // Fallback to any available SS
+                if (data_port == 0) {
+                    for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->is_up) { data_port = e->ss_data_port; break; } }
+                }
+                pthread_mutex_unlock(&g_mu);
+                if (data_port != 0) {
+                    int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                    if (sfd >= 0) {
+                        char req[512]; req[0]='\0';
+                        json_put_string_field(req, sizeof(req), "type", "CREATEFOLDER", 1);
+                        json_put_string_field(req, sizeof(req), "path", path, 0);
+                        strncat(req, "}", sizeof(req)-strlen(req)-1);
+                        (void)send_msg(sfd, req, (uint32_t)strlen(req));
+                        char *rr=NULL; uint32_t rrl=0; (void)recv_msg(sfd, &rr, &rrl); if (rr) free(rr); close(sfd);
+                    }
+                }
                 const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             }
         } else if (strcmp(type, "VIEWFOLDER") == 0) {
@@ -698,76 +722,98 @@ static void *client_thread(void *arg) {
             if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
             send_msg(fd, resp, (uint32_t)strlen(resp));
         } else if (strcmp(type, "MOVE") == 0) {
-            // MOVE can move a file or a folder prefix
-            char src[256], dst[256]; src[0]=dst[0]='\0';
-            if (json_get_string_field(buf, "src", src, sizeof(src)) != 0 || json_get_string_field(buf, "dst", dst, sizeof(dst)) != 0) {
+            // MOVE can move a file or a folder prefix; also support moving a file into a known folder
+            char src[256], dst_in[256]; src[0]=dst_in[0]='\0';
+            if (json_get_string_field(buf, "src", src, sizeof(src)) != 0 || json_get_string_field(buf, "dst", dst_in, sizeof(dst_in)) != 0) {
                 const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {
-                // Check if src is an existing file mapping
-                int ssid = 0;
-                if (nm_state_find_dir(src, &ssid) == 0) {
-                    // File move: reuse RENAME path
-                    pthread_mutex_lock(&g_mu);
-                    ss_entry_t *e = g_ss_list; int data_port = 0; while (e) { if (e->ss_id == ssid) { data_port = e->ss_data_port; break; } e = e->next; }
-                    pthread_mutex_unlock(&g_mu);
-                    if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
-                        if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            char req[512]; req[0]='\0';
-                            json_put_string_field(req, sizeof(req), "type", "RENAME", 1);
-                            json_put_string_field(req, sizeof(req), "file", src, 0);
-                            json_put_string_field(req, sizeof(req), "newFile", dst, 0);
-                            strncat(req, "}", sizeof(req)-strlen(req)-1);
-                            if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
-                                char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
-                                    nm_dir_rename(src, dst); nm_acl_rename(src, dst);
-                                    (void)nm_state_save("nm_state.json");
-                                    const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
-                                } else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                                free(r);
-                            } else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                            close(sfd);
-                        }
-                    }
+                // Normalize destination and detect if it's a known folder
+                char dst[256]; snprintf(dst, sizeof(dst), "%s", dst_in);
+                // strip trailing slashes (except if root "")
+                size_t dl = strlen(dst); while (dl>0 && dst[dl-1]=='/') dst[--dl] = '\0';
+                int is_folder = 0;
+                {
+                    char folders[256][256]; size_t nf = nm_state_get_folders(folders, 256);
+                    for (size_t i=0;i<nf;i++){ if (strcmp(folders[i], dst) == 0) { is_folder = 1; break; } }
+                }
+                char final_dst[256];
+                if (is_folder) {
+                    // final path = dst + "/" + basename(src)
+                    const char *base = strrchr(src, '/'); base = base ? base + 1 : src;
+                    if (dl == 0) snprintf(final_dst, sizeof(final_dst), "%s", base);
+                    else snprintf(final_dst, sizeof(final_dst), "%s/%s", dst, base);
                 } else {
-                    // Treat as folder move: compute impacted files and rename on respective SS
-                    char files[1024][128]; char new_files[1024][128]; int ssids[1024];
-                    int n = nm_state_move_folder_prefix(src, dst, files, new_files, ssids, 1024);
-                    if (n <= 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        int failures = 0;
-                        for (int i=0; i<n; ++i) {
-                            int data_port = 0;
-                            pthread_mutex_lock(&g_mu);
-                            for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->ss_id == ssids[i]) { data_port = e->ss_data_port; break; } }
-                            pthread_mutex_unlock(&g_mu);
-                            if (data_port == 0) { failures++; continue; }
+                    snprintf(final_dst, sizeof(final_dst), "%s", dst);
+                }
+                // If no-op (same path), acknowledge success
+                if (strcmp(src, final_dst) == 0) { const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
+                else {
+                    // Check if src is an existing file mapping
+                    int ssid = 0;
+                    if (nm_state_find_dir(src, &ssid) == 0) {
+                        // File move: reuse RENAME path
+                        pthread_mutex_lock(&g_mu);
+                        ss_entry_t *e = g_ss_list; int data_port = 0; while (e) { if (e->ss_id == ssid) { data_port = e->ss_data_port; break; } e = e->next; }
+                        pthread_mutex_unlock(&g_mu);
+                        if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        else {
                             int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
-                            if (sfd < 0) { failures++; continue; }
-                            char req[512]; req[0]='\0';
-                            json_put_string_field(req, sizeof(req), "type", "RENAME", 1);
-                            json_put_string_field(req, sizeof(req), "file", files[i], 0);
-                            json_put_string_field(req, sizeof(req), "newFile", new_files[i], 0);
-                            strncat(req, "}", sizeof(req)-strlen(req)-1);
-                            if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); failures++; continue; }
-                            char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { failures++; }
-                            else { nm_acl_rename(files[i], new_files[i]); }
-                            free(r); close(sfd);
+                            if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                            else {
+                                char req[512]; req[0]='\0';
+                                json_put_string_field(req, sizeof(req), "type", "RENAME", 1);
+                                json_put_string_field(req, sizeof(req), "file", src, 0);
+                                json_put_string_field(req, sizeof(req), "newFile", final_dst, 0);
+                                strncat(req, "}", sizeof(req)-strlen(req)-1);
+                                if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
+                                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                        nm_dir_rename(src, final_dst); nm_acl_rename(src, final_dst);
+                                        (void)nm_state_save("nm_state.json");
+                                        const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+                                    } else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                    free(r);
+                                } else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                close(sfd);
+                            }
                         }
-                        if (failures) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                        else { (void)nm_state_save("nm_state.json"); const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                    } else {
+                        // Treat as folder move (prefix): compute impacted files and rename on respective SS
+                        char files[1024][128]; char new_files[1024][128]; int ssids[1024];
+                        int n = nm_state_move_folder_prefix(src, final_dst, files, new_files, ssids, 1024);
+                        if (n <= 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        else {
+                            int failures = 0;
+                            for (int i=0; i<n; ++i) {
+                                int data_port = 0;
+                                pthread_mutex_lock(&g_mu);
+                                for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->ss_id == ssids[i]) { data_port = e->ss_data_port; break; } }
+                                pthread_mutex_unlock(&g_mu);
+                                if (data_port == 0) { failures++; continue; }
+                                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                                if (sfd < 0) { failures++; continue; }
+                                char req[512]; req[0]='\0';
+                                json_put_string_field(req, sizeof(req), "type", "RENAME", 1);
+                                json_put_string_field(req, sizeof(req), "file", files[i], 0);
+                                json_put_string_field(req, sizeof(req), "newFile", new_files[i], 0);
+                                strncat(req, "}", sizeof(req)-strlen(req)-1);
+                                if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); failures++; continue; }
+                                char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { failures++; }
+                                else { nm_acl_rename(files[i], new_files[i]); }
+                                free(r); close(sfd);
+                            }
+                            if (failures) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                            else { (void)nm_state_save("nm_state.json"); const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        }
                     }
                 }
             }
         } else if (strcmp(type, "ADDACCESS") == 0) {
             char file[128], target[128], mode[8];
             if (json_get_string_field(buf, "file", file, sizeof(file)) != 0 || json_get_string_field(buf, "user", target, sizeof(target)) != 0 || json_get_string_field(buf, "mode", mode, sizeof(mode)) != 0) {
-                const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
+                const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er));
             } else {
                 int perm = (strcmp(mode, "RW")==0)? (ACL_R|ACL_W) : (strcmp(mode, "W")==0? ACL_W : ACL_R);
-                nm_acl_grant(file, target, perm);
+                nm_acl_grant(file, target, perm); nm_state_remove_request(file, target);
                 (void)nm_state_save("nm_state.json");
                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
             }
@@ -779,6 +825,32 @@ static void *client_thread(void *arg) {
                 nm_acl_revoke(file, target);
                 (void)nm_state_save("nm_state.json");
                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+            }
+        } else if (strcmp(type, "VIEWREQUESTS") == 0) {
+            char file[128]; char user[128];
+            if (json_get_string_field(buf, "file", file, sizeof(file)) != 0 || json_get_string_field(buf, "user", user, sizeof(user)) != 0) {
+                const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er));
+            } else {
+                char owner[128]; if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    char users[256][128]; char modes[256]; size_t n = nm_state_list_requests(file, users, modes, 256);
+                    char resp[4096]; size_t w=0; w+=snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"requests\":[");
+                    for (size_t i=0;i<n;i++) { if (i) w+=snprintf(resp+w, sizeof(resp)-w, ","); w+=snprintf(resp+w, sizeof(resp)-w, "{\"user\":\"%s\",\"mode\":\"%c\"}", users[i], (modes[i]=='W'?'W':'R')); }
+                    if (w < sizeof(resp)) w+=snprintf(resp+w, sizeof(resp)-w, "]}");
+                    send_msg(fd, resp, (uint32_t)strlen(resp));
+                }
+            }
+        } else if (strcmp(type, "REQUEST_ACCESS") == 0) {
+            char file[128]; char user[128]; char mode[8] = {0};
+            if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", user, sizeof(user))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                (void)json_get_string_field(buf, "mode", mode, sizeof(mode)); char m = (mode[0]=='W' ? 'W' : 'R');
+                if (nm_state_find_dir(file, NULL) != 0) { const char *er="{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    int added = nm_state_add_request(file, user, m);
+                    if (added) { (void)nm_state_save("nm_state.json"); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
+                    else { const char *er="{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                }
             }
         } else if (strcmp(type, "CLIENT_HELLO") == 0) {
             char user[128];
@@ -825,7 +897,7 @@ static void *client_thread(void *arg) {
             strcat(resp, "]}");
             pthread_mutex_unlock(&g_mu);
             send_msg(fd, resp, (uint32_t)strlen(resp));
-        } else if (strcmp(type, "LIST_USERS") == 0) {
+    } else if (strcmp(type, "LIST_USERS") == 0) {
             // Return only active users (logged-in)
             char users[256][128]; size_t n = nm_state_get_active_users(users, 256);
             char resp[4096]; size_t w = 0; w += snprintf(resp + w, sizeof(resp) - w, "{\"status\":\"OK\",\"users\":[");
@@ -835,29 +907,6 @@ static void *client_thread(void *arg) {
             }
             if (w < sizeof(resp)) w += snprintf(resp + w, sizeof(resp) - w, "]}");
             send_msg(fd, resp, (uint32_t)strlen(resp));
-        } else if (strcmp(type, "REQUEST_ACCESS") == 0) {
-            char file[128]; char user[128]; if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", user, sizeof(user))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-            else {
-                if (nm_state_find_dir(file, NULL) != 0) { const char *er="{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                else {
-                    // Try add; if already exists, return ERR_CONFLICT as closest existing code
-                    int added = nm_state_add_request(file, user);
-                    if (added) { (void)nm_state_save("nm_state.json"); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
-                    else { const char *er="{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                }
-            }
-        } else if (strcmp(type, "VIEWREQUESTS") == 0) {
-            char file[128]; char user[128]; if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", user, sizeof(user))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-            else {
-                char owner[128]; if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) { const char *er="{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                else {
-                    char users[256][128]; size_t n = nm_state_list_requests(file, users, 256);
-                    char resp[4096]; size_t w=0; w+=snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"requests\":[");
-                    for (size_t i=0;i<n;i++){ if (i) w+=snprintf(resp+w, sizeof(resp)-w, ","); w+=snprintf(resp+w, sizeof(resp)-w, "\"%s\"", users[i]); }
-                    if (w < sizeof(resp)) w+=snprintf(resp+w, sizeof(resp)-w, "]}");
-                    send_msg(fd, resp, (uint32_t)strlen(resp));
-                }
-            }
         } else if (strcmp(type, "APPROVE_ACCESS") == 0) {
             char file[128]; char owner[128]; char target[128]; char mode[8]; owner[0]=mode[0]=0;
             if (json_get_string_field(buf, "file", file, sizeof(file))!=0 || json_get_string_field(buf, "user", owner, sizeof(owner))!=0 || json_get_string_field(buf, "target", target, sizeof(target))!=0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -894,7 +943,11 @@ static void *client_thread(void *arg) {
                 w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"files\":[");
                 int first=1;
                 for (size_t i=0;i<n;i++) {
-                    if (!all && nm_acl_check(files[i], user, "READ") != 0) continue;
+                    if (!all) {
+                        int can_r = (nm_acl_check(files[i], user, "READ") == 0);
+                        int can_w = (nm_acl_check(files[i], user, "WRITE") == 0);
+                        if (!(can_r || can_w)) continue;
+                    }
                     if (!first) w += snprintf(resp+w, sizeof(resp)-w, ",");
                     first=0;
                     w += snprintf(resp+w, sizeof(resp)-w, "\"%s\"", files[i]);
@@ -908,25 +961,37 @@ static void *client_thread(void *arg) {
                 int first=1;
                 for (size_t i=0;i<n;i++) {
                     const char *f = files[i]; int ssid = ssids[i];
-                    if (!all && nm_acl_check(f, user, "READ") != 0) continue;
-                    // resolve ss data port
-                    int data_port=0; pthread_mutex_lock(&g_mu);
-                    for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ data_port=e->ss_data_port; break; } }
-                    pthread_mutex_unlock(&g_mu);
-                    if (data_port==0) continue;
-                    // Build READ ticket for INFO
-                    char ticket[256]; if (ticket_build(f, "READ", ssid, 600, ticket, sizeof(ticket)) != 0) continue;
-                    // Query SS INFO
-                    int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) continue;
-                    char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "INFO", 1);
-                    json_put_string_field(req, sizeof(req), "file", f, 0);
-                    json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
-                    strncat(req, "}", sizeof(req)-strlen(req)-1);
-                    if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); continue; }
-                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if(r) free(r); close(sfd); continue; }
-                    // parse fields
-                    int size=0, words=0, chars=0, mtime=0, atime=0; (void)json_get_int_field(r, "size", &size); (void)json_get_int_field(r, "words", &words); (void)json_get_int_field(r, "chars", &chars); (void)json_get_int_field(r, "mtime", &mtime); (void)json_get_int_field(r, "atime", &atime);
-                    free(r); close(sfd);
+                    int can_r = (nm_acl_check(f, user, "READ") == 0);
+                    int can_w = (nm_acl_check(f, user, "WRITE") == 0);
+                    if (!all && !(can_r || can_w)) continue;
+                    int size=0, words=0, chars=0, mtime=0, atime=0;
+            if (can_r || can_w) {
+                        // resolve ss data port
+                        int data_port=0; pthread_mutex_lock(&g_mu);
+                        for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ data_port=e->ss_data_port; break; } }
+                        pthread_mutex_unlock(&g_mu);
+                        if (data_port!=0) {
+                // Build READ ticket if allowed, else WRITE ticket
+                char ticket[256]; const char *op = can_r ? "READ" : "WRITE";
+                if (ticket_build(f, op, ssid, 600, ticket, sizeof(ticket)) == 0) {
+                                // Query SS INFO
+                                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                                if (sfd >= 0) {
+                                    char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "INFO", 1);
+                                    json_put_string_field(req, sizeof(req), "file", f, 0);
+                                    json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
+                                    strncat(req, "}", sizeof(req)-strlen(req)-1);
+                                    if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
+                                        char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) == 0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                            (void)json_get_int_field(r, "size", &size); (void)json_get_int_field(r, "words", &words); (void)json_get_int_field(r, "chars", &chars); (void)json_get_int_field(r, "mtime", &mtime); (void)json_get_int_field(r, "atime", &atime);
+                                        }
+                                        if (r) free(r);
+                                    }
+                                    close(sfd);
+                                }
+                            }
+                        }
+                    }
                     char owner[128]; owner[0]='\0'; (void)nm_acl_get_owner(f, owner, sizeof(owner));
                     if (!first) { w += snprintf(resp+w, sizeof(resp)-w, ","); }
                     first = 0;

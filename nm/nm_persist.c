@@ -28,8 +28,8 @@ typedef struct {
     char **folders;
     size_t n_folders;
     size_t cap_folders;
-    // Access requests per file
-    struct req_entry { char *file; char **users; size_t n_users; size_t cap_users; } *requests;
+    // Access requests per file (with mode per user: 'R' or 'W')
+    struct req_entry { char *file; char **users; char *modes; size_t n_users; size_t cap_users; } *requests;
     size_t n_requests;
     size_t cap_requests;
 } nm_state_t;
@@ -239,10 +239,14 @@ int nm_state_save(const char *path) {
         strcat(buf, "\":[");
         for (size_t j=0;j<g_state.requests[i].n_users;j++) {
             if (j) strcat(buf, ",");
-            strcat(buf, "\"");
+            // New format: object with user and mode
+            strcat(buf, "{\"user\":\"");
             const char *u = g_state.requests[i].users[j];
             for (; u && *u; ++u) { if (*u == '"' || *u == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*u,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}            
-            strcat(buf, "\"");
+            strcat(buf, "\",\"mode\":\"");
+            char md[2] = { g_state.requests[i].modes ? g_state.requests[i].modes[j] : 'R', 0 };
+            strncat(buf, md, bufcap - strlen(buf) - 1);
+            strcat(buf, "\"}");
         }
         strcat(buf, "]");
     }
@@ -865,7 +869,7 @@ static struct req_entry *find_req_entry(const char *file) {
     return NULL;
 }
 
-int nm_state_add_request(const char *file, const char *user) {
+int nm_state_add_request(const char *file, const char *user, char mode) {
     if (!file || !user || !*user) return 0;
     if (nm_state_find_dir(file, NULL) != 0) return 0; // only for known files
     struct req_entry *e = find_req_entry(file);
@@ -882,16 +886,19 @@ int nm_state_add_request(const char *file, const char *user) {
     if (e->cap_users < need) {
         size_t nc = e->cap_users ? e->cap_users * 2 : 4; while (nc < need) nc *= 2;
         char **nu = (char **)realloc(e->users, nc * sizeof(char *)); if (!nu) return 0; e->users = nu; e->cap_users = nc;
+        char *nm = (char *)realloc(e->modes, nc * sizeof(char)); if (!nm) return 0; e->modes = nm;
     }
-    e->users[e->n_users] = strdup(user); if (!e->users[e->n_users]) return 0; e->n_users++;
+    e->users[e->n_users] = strdup(user); if (!e->users[e->n_users]) return 0;
+    e->modes[e->n_users] = (mode=='W'?'W':'R');
+    e->n_users++;
     return 1;
 }
 
-size_t nm_state_list_requests(const char *file, char users[][128], size_t max_users) {
+size_t nm_state_list_requests(const char *file, char users[][128], char modes[], size_t max_users) {
     struct req_entry *e = find_req_entry(file);
     if (!e) return 0;
     size_t c = e->n_users < max_users ? e->n_users : max_users;
-    for (size_t i=0;i<c;i++) snprintf(users[i], 128, "%s", e->users[i]);
+    for (size_t i=0;i<c;i++) { snprintf(users[i], 128, "%s", e->users[i]); modes[i] = e->modes ? e->modes[i] : 'R'; }
     return c;
 }
 
@@ -901,7 +908,7 @@ int nm_state_remove_request(const char *file, const char *user) {
     for (size_t i=0;i<e->n_users;i++) {
         if (strcmp(e->users[i], user)==0) {
             free(e->users[i]);
-            if (i != e->n_users - 1) e->users[i] = e->users[e->n_users - 1];
+            if (i != e->n_users - 1) { e->users[i] = e->users[e->n_users - 1]; if (e->modes) e->modes[i] = e->modes[e->n_users - 1]; }
             e->n_users--;
             return 1;
         }
@@ -914,6 +921,7 @@ int nm_state_clear_requests_for(const char *file) {
     if (!e) return 0;
     for (size_t i=0;i<e->n_users;i++) if (e->users[i]) free(e->users[i]);
     free(e->users); e->users=NULL; e->n_users=0; e->cap_users=0;
+    if (e->modes) { free(e->modes); e->modes=NULL; }
     // remove entry itself
     free(e->file);
     if (e != &g_state.requests[g_state.n_requests-1]) *e = g_state.requests[g_state.n_requests-1];
@@ -937,10 +945,39 @@ static void parse_requests_object(const char *json) {
     p++;
         while (*p && *p!=']') {
             while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
-            if (*p=='"') {
+            if (*p=='{') {
+                // New object format: {"user":"...","mode":"R|W"}
+                p++;
+                char user[128]={0}; char mode='R';
+                while (*p && *p!='}') {
+                    while(*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                    if (*p=='"') {
+                        p++; const char *k=p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
+                        size_t klen=(size_t)(p-k); char key[16]; size_t ki=0; const char *ks=k; while(ki<klen&&*ks){ if(*ks=='\\'&&ks[1]){ks++; key[ki++]=*ks++;} else key[ki++]=*ks++; } key[ki]='\0'; if (*p=='"') p++;
+                        while(*p && *p!=':') p++;
+                        if (*p==':') p++;
+                        while(*p==' '||*p=='\n'||*p=='\t') p++;
+                        if (strcmp(key,"user")==0 && *p=='"') {
+                            p++; const char *ust=p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
+                            size_t ulen=(size_t)(p-ust); size_t ui=0; const char *us=ust; while(ui<ulen&&*us){ if(*us=='\\'&&us[1]){us++; user[ui++]=*us++;} else user[ui++]=*us++; } user[ui]='\0'; if (*p=='"') p++;
+                        } else if (strcmp(key,"mode")==0 && *p=='"') {
+                            p++; if (*p=='W'||*p=='R') mode=*p; while(*p && *p!='"') p++; if (*p=='"') p++;
+                        } else {
+                            // skip value
+                            while(*p && *p!=',' && *p!='}') p++;
+                        }
+                    } else {
+                        while(*p && *p!=',' && *p!='}') p++;
+                    }
+                    if (*p==',') p++;
+                }
+                if (*p=='}') p++;
+                if (user[0]) nm_state_add_request(file, user, mode);
+            } else if (*p=='"') {
+                // Backward-compatible: old format was array of usernames
                 p++; const char *ust=p; while(*p && *p!='"'){ if(*p=='\\'&&p[1]) p+=2; else p++; }
                 size_t ulen=(size_t)(p-ust); char user[128]; size_t ui=0; const char *us=ust; while(ui<ulen&&*us){ if(*us=='\\'&&us[1]){us++; user[ui++]=*us++;} else user[ui++]=*us++; } user[ui]='\0'; if (*p=='"') p++;
-                nm_state_add_request(file, user);
+                nm_state_add_request(file, user, 'R');
             }
             while (*p && *p!=',' && *p!=']') p++;
             if (*p==',') p++;

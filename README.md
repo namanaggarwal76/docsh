@@ -36,7 +36,7 @@ Then start a client shell (you’ll be prompted for username):
 
 - VIEW [-a] [-l]
 - READ <file>
-- CREATE <file> [-r] [-w]
+- CREATE <file> [-r] [-w] 
 - WRITE <file> <sentenceIndex>
 - UNDO <file>
 - INFO <file>
