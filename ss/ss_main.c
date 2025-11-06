@@ -33,10 +33,78 @@ typedef struct lock_node {
 static lock_node_t *g_locks = NULL;
 static pthread_mutex_t g_lock_mu = PTHREAD_MUTEX_INITIALIZER;
 
+// Forward declaration (defined later in file)
+static void ensure_parent_dirs_for(const char *path);
+
+// Per-file read snapshot management so readers can see the last committed copy during writes
+typedef struct snap_entry {
+    char file[128];
+    int refcount;
+    struct snap_entry *next;
+} snap_entry_t;
+static snap_entry_t *g_snapshots = NULL;
+static pthread_mutex_t g_snap_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void snapshot_path_for(const char *file, char *out, size_t out_sz) {
+    snprintf(out, out_sz, "%s/snapshots/%s.snap", g_store_root, file);
+}
+
+static void snapshot_ref_inc(const char *file) {
+    pthread_mutex_lock(&g_snap_mu);
+    snap_entry_t *e = g_snapshots; while (e) { if (strcmp(e->file, file) == 0) { e->refcount++; pthread_mutex_unlock(&g_snap_mu); return; } e = e->next; }
+    // new entry
+    e = (snap_entry_t *)calloc(1, sizeof(*e));
+    if (e) {
+        snprintf(e->file, sizeof(e->file), "%s", file);
+        e->refcount = 1;
+        e->next = g_snapshots; g_snapshots = e;
+    }
+    pthread_mutex_unlock(&g_snap_mu);
+}
+
+static int snapshot_ref_dec_and_should_delete(const char *file) {
+    int should_delete = 0;
+    pthread_mutex_lock(&g_snap_mu);
+    snap_entry_t **pp = &g_snapshots; snap_entry_t *cur = g_snapshots;
+    while (cur) {
+        if (strcmp(cur->file, file) == 0) {
+            cur->refcount--;
+            if (cur->refcount <= 0) { *pp = cur->next; free(cur); should_delete = 1; }
+            break;
+        }
+        pp = &cur->next; cur = cur->next;
+    }
+    pthread_mutex_unlock(&g_snap_mu);
+    return should_delete;
+}
+
+static void snapshot_ensure_written(const char *file, const char *data, size_t len) {
+    char spath[SS_PATH_MAX]; snapshot_path_for(file, spath, sizeof(spath));
+    // If already exists, nothing to do
+    FILE *t = fopen(spath, "rb");
+    if (t) { fclose(t); return; }
+    ensure_parent_dirs_for(spath);
+    FILE *f = fopen(spath, "wb");
+    if (!f) { perror("[SS] snapshot fopen"); return; }
+    if (data && len > 0) fwrite(data, 1, len, f);
+    fflush(f); fclose(f);
+    fprintf(stderr, "[SS] snapshot created: %s (len=%zu)\n", spath, len);
+}
+
+static void snapshot_delete_if_exists(const char *file) {
+    char spath[SS_PATH_MAX]; snapshot_path_for(file, spath, sizeof(spath));
+    (void)unlink(spath);
+}
+
 static int lock_acquire(const char *file, int sidx) {
     pthread_mutex_lock(&g_lock_mu);
     for (lock_node_t *n = g_locks; n; n = n->next) {
         if (n->sentence_idx == sidx && strcmp(n->file, file) == 0) {
+            // Debug: log current locks when denying
+            fprintf(stderr, "[SS] lock_acquire DENY file=%s sidx=%d (existing lock)\n", file, sidx);
+            for (lock_node_t *m = g_locks; m; m = m->next) {
+                fprintf(stderr, "[SS]   held: file=%s sidx=%d\n", m->file, m->sentence_idx);
+            }
             pthread_mutex_unlock(&g_lock_mu);
             return -1; // already locked
         }
@@ -207,7 +275,7 @@ static void *data_server_thread(void *arg) {
             char *buf = NULL; uint32_t len = 0;
             if (recv_msg(cfd, &buf, &len) != 0) { fprintf(stderr, "[SS] recv_msg error or EOF\n"); free(buf); break; }
             if (!buf || len == 0) { fprintf(stderr, "[SS] empty msg\n"); free(buf); break; }
-            fprintf(stderr, "[SS] recv %u bytes: %.*s\n", len, (int)len, buf); fflush(stderr);
+            fprintf(stderr, "[SS] recv %u bytes\n", len); fflush(stderr);
             char type[32];
             if (json_get_string_field(buf, "type", type, sizeof(type)) == 0) {
                 fprintf(stderr, "[SS] type=%s\n", type); fflush(stderr);
@@ -221,9 +289,13 @@ static void *data_server_thread(void *arg) {
                     } else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) {
                         const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                     } else {
+                        // Prefer snapshot if a write session is active (snapshot exists)
+                        char spath[SS_PATH_MAX]; snapshot_path_for(file, spath, sizeof(spath));
                         char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                        const char *rpath = path;
+                        FILE *sf = fopen(spath, "rb"); if (sf) { fclose(sf); rpath = spath; }
                         char *content = NULL; size_t clen = 0;
-                        if (read_file_into(path, &content, &clen) == 0) {
+                        if (read_file_into(rpath, &content, &clen) == 0) {
                             char resp[8192]; resp[0] = '\0';
                             strncat(resp, "{\"status\":\"OK\",\"body\":\"", sizeof(resp) - strlen(resp) - 1);
                             json_escape_append(resp, sizeof(resp), content);
@@ -314,7 +386,11 @@ static void *data_server_thread(void *arg) {
                     else {
                         int lrc = lock_acquire(file, sidx);
                         fprintf(stderr, "[SS] lock_acquire rc=%d\n", lrc); fflush(stderr);
-                        if (lrc != 0) { const char *resp = "{\"status\":\"ERR_LOCKED\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        if (lrc != 0) {
+                            // Include context to aid client-side diagnostics
+                            char er[128]; snprintf(er, sizeof(er), "{\"status\":\"ERR_LOCKED\",\"msg\":\"sentence-%d-locked\"}", sidx);
+                            send_msg(cfd, er, (uint32_t)strlen(er));
+                        }
                         else {
                             char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                             char *content = NULL; size_t clen = 0;
@@ -336,6 +412,9 @@ static void *data_server_thread(void *arg) {
                                     const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                                 } else {
                                     ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image=NULL; ws.pre_image_len=0;
+                                    // Create/retain snapshot for readers (empty pre-image)
+                                    snapshot_ref_inc(file);
+                                    snapshot_ensure_written(file, NULL, 0);
                                     fprintf(stderr, "[SS] BEGIN_WRITE session started (empty doc), sidx=%d\n", sidx); fflush(stderr);
                                     const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                                 }
@@ -364,6 +443,9 @@ static void *data_server_thread(void *arg) {
                                             doc.sent_words[ns-1] = NULL; doc.word_counts[ns-1] = 0;
                                             // Start session now that the sentence exists
                                             ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
+                                            // Create/retain snapshot for readers from pre-image
+                                            snapshot_ref_inc(file);
+                                            snapshot_ensure_written(file, pre, pre ? prelen : 0);
                                             fprintf(stderr, "[SS] BEGIN_WRITE session started (append new sentence), sidx=%d\n", sidx); fflush(stderr);
                                             const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                                             // Do not free pre/content here; handled after outer scope
@@ -371,6 +453,9 @@ static void *data_server_thread(void *arg) {
                                     }
                                     else {
                                         ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
+                                        // Create/retain snapshot for readers from pre-image
+                                        snapshot_ref_inc(file);
+                                        snapshot_ensure_written(file, pre, pre ? prelen : 0);
                                         fprintf(stderr, "[SS] BEGIN_WRITE session started, sidx=%d\n", sidx); fflush(stderr);
                                         const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
                                     }
@@ -445,7 +530,9 @@ static void *data_server_thread(void *arg) {
                                 }
                             }
                         }
+                        // Release per-sentence lock and snapshot reference
                         lock_release(ws.file, ws.sentence_idx);
+                        if (snapshot_ref_dec_and_should_delete(ws.file)) { snapshot_delete_if_exists(ws.file); }
                         ss_tokens_free(&ws.doc);
                         if (ws.pre_image) { free(ws.pre_image); ws.pre_image=NULL; ws.pre_image_len=0; }
                         memset(&ws, 0, sizeof(ws));
@@ -726,9 +813,12 @@ static void *data_server_thread(void *arg) {
                     if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
+                        // Prefer snapshot if available
+                        char spath[SS_PATH_MAX]; snapshot_path_for(file, spath, sizeof(spath));
                         char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                        const char *rpath = path; FILE *sf = fopen(spath, "rb"); if (sf) { fclose(sf); rpath = spath; }
                         char *content=NULL; size_t clen=0;
-                        if (read_file_into(path, &content, &clen) != 0 || !content) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        if (read_file_into(rpath, &content, &clen) != 0 || !content) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                         else {
                             // Simple split by whitespace into words
                             size_t i=0;
@@ -761,7 +851,13 @@ static void *data_server_thread(void *arg) {
             }
             free(buf);
         }
-        if (ws.active) { lock_release(ws.file, ws.sentence_idx); ss_tokens_free(&ws.doc); if (ws.pre_image) free(ws.pre_image); }
+        if (ws.active) {
+            // Cleanup on abrupt connection end
+            lock_release(ws.file, ws.sentence_idx);
+            if (snapshot_ref_dec_and_should_delete(ws.file)) { snapshot_delete_if_exists(ws.file); }
+            ss_tokens_free(&ws.doc);
+            if (ws.pre_image) free(ws.pre_image);
+        }
         close(cfd);
     }
     close(lfd);

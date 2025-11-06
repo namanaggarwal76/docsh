@@ -5,6 +5,7 @@
 #include <termios.h>
 #include <ctype.h>
 #include <strings.h>
+#include <errno.h>
 #include <time.h>
 #include "../common/net_proto.h"
 
@@ -353,24 +354,30 @@ static void print_human(const char *who, const char *json) {
         printf("OK\n");
         return;
     }
-    // Errors: map to human messages
+    // Errors: map to human messages (avoid dumping raw JSON)
     if (strcmp(status, "ERR_NOTFOUND") == 0) {
-        printf("ERROR: not found\n"); return;
+        printf("ERROR: resource not found (file/checkpoint/version may not exist)\n"); return;
     } else if (strcmp(status, "ERR_NOAUTH") == 0) {
-        printf("ERROR: permission denied\n"); return;
+        printf("ERROR: permission denied (request access or contact owner)\n"); return;
     } else if (strcmp(status, "ERR_CONFLICT") == 0) {
-        printf("ERROR: conflict\n"); return;
+        printf("ERROR: conflict (name already exists or operation conflicts)\n"); return;
     } else if (strcmp(status, "ERR_LOCKED") == 0) {
-        printf("ERROR: locked\n"); return;
+        printf("ERROR: sentence locked by another writer; try again later\n"); return;
     } else if (strcmp(status, "ERR_UNAVAILABLE") == 0) {
-        printf("ERROR: service unavailable\n"); return;
+        printf("ERROR: service unavailable (no storage server reachable)\n"); return;
     } else if (strcmp(status, "ERR_BADREQ") == 0) {
-        printf("ERROR: bad request\n"); return;
+        char msg[256]={0};
+        if (json_get_string_field(json, "msg", msg, sizeof(msg))==0 && msg[0])
+            printf("ERROR: bad request (%s)\n", msg);
+        else
+            printf("ERROR: bad request (invalid arguments/index or wrong sequence)\n");
+        return;
     } else if (strcmp(status, "ERR_INTERNAL") == 0) {
-        printf("ERROR: internal server error\n"); return;
+        printf("ERROR: internal server error (I/O failure or unexpected state)\n"); return;
     }
-    // Fallback
-    printf("%s\n", json);
+    // Fallback without raw JSON
+    if (status[0]) printf("ERROR: server returned status '%s'\n", status);
+    else printf("ERROR: unrecognized server response\n");
 }
 
 int main(int argc, char **argv) {
@@ -509,13 +516,12 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp = NULL; uint32_t rlen = 0;
-    if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-    fprintf(stderr, "[CLI] LOOKUP response: %.*s\n", rlen, resp ? resp : "");
+    if (recv_msg(fd, &resp, &rlen) < 0) { fprintf(stderr, "ERROR: failed to receive LOOKUP from NM\n"); close(fd); return 1; }
         // Parse ssDataPort
     int dport = 0; char ssaddr[64] = {0}; char ticket[256] = {0};
     int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
         free(resp); close(fd);
-        if (!ok || dport <= 0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    if (!ok || dport <= 0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         // Connect to SS and READ
         int sfd = tcp_connect(ssaddr, (uint16_t)dport);
         if (sfd < 0) { perror("connect SS"); return 1; }
@@ -541,7 +547,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         strncat(payload, "}", sizeof(payload)-strlen(payload)-1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-        int dport=0; char ssaddr[64]={0}; char ticket[256]={0}; int ok = (json_get_int_field(resp, "ssDataPort", &dport)==0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr))==0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket))==0); free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    int dport=0; char ssaddr[64]={0}; char ticket[256]={0}; int ok = (json_get_int_field(resp, "ssDataPort", &dport)==0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr))==0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket))==0); free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
         char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "STREAM", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
         if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { perror("send STREAM"); close(sfd); return 1; }
@@ -590,7 +596,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         strncat(payload, "}", sizeof(payload)-strlen(payload)-1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) != 0) { perror("send"); close(fd); return 1; }
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) != 0) { perror("recv"); close(fd); return 1; }
-        int dport=0; char ssaddr[64]={0}; char ticket[256]={0}; int ok=(json_get_int_field(resp, "ssDataPort", &dport)==0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr))==0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket))==0); free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    int dport=0; char ssaddr[64]={0}; char ticket[256]={0}; int ok=(json_get_int_field(resp, "ssDataPort", &dport)==0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr))==0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket))==0); free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd<0){ perror("connect SS"); return 1; }
         char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "BEGIN_WRITE", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_int_field(req, sizeof(req), "sentenceIndex", sidx, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
         if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { perror("send BEGIN_WRITE"); close(sfd); return 1; }
@@ -636,12 +642,11 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp = NULL; uint32_t rlen = 0;
-        if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-        fprintf(stderr, "[CLI] LOOKUP response: %.*s\n", rlen, resp ? resp : "");
+    if (recv_msg(fd, &resp, &rlen) < 0) { fprintf(stderr, "ERROR: failed to receive LOOKUP from NM\n"); close(fd); return 1; }
         int dport = 0; char ssaddr[64] = {0}; char ticket[256] = {0};
         int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
         free(resp); close(fd);
-        if (!ok || dport <= 0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    if (!ok || dport <= 0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport);
         if (sfd < 0) { perror("connect SS"); return 1; }
         char req[256]; req[0] = '\0';
@@ -664,12 +669,11 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
-        char *resp = NULL; uint32_t rlen = 0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
-        fprintf(stderr, "[CLI] LOOKUP response: %.*s\n", rlen, resp ? resp : "");
+    char *resp = NULL; uint32_t rlen = 0; if (recv_msg(fd, &resp, &rlen) < 0) { fprintf(stderr, "ERROR: failed to receive LOOKUP from NM\n"); close(fd); return 1; }
         int dport = 0; char ssaddr[64] = {0}; char ticket[256] = {0};
         int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
         free(resp); close(fd);
-        if (!ok || dport <= 0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    if (!ok || dport <= 0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
         char req[256]; req[0] = '\0';
         json_put_string_field(req, sizeof(req), "type", "REVERT", 1);
@@ -750,7 +754,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
         int dport=0; char ssaddr[64]={0}; char ticket[256]={0};
         int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
-        free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
         char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "CHECKPOINT", 1);
         json_put_string_field(req, sizeof(req), "file", file, 0);
@@ -772,7 +776,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
         int dport=0; char ssaddr[64]={0}; char ticket[256]={0};
         int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
-        free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
         char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "LISTCHECKPOINTS", 1);
         json_put_string_field(req, sizeof(req), "file", file, 0);
@@ -793,7 +797,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
         int dport=0; char ssaddr[64]={0}; char ticket[256]={0};
         int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
-        free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "[CLI] LOOKUP failed\n"); return 1; }
+    free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
         char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "VIEWCHECKPOINT", 1);
         json_put_string_field(req, sizeof(req), "file", file, 0);

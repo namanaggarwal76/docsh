@@ -164,7 +164,6 @@ static void *hb_monitor_thread(void *arg) {
                 if (promoted) (void)nm_state_save("nm_state.json");
             }
         }
-        // Sleep ~2 seconds
         sleep(2);
     }
     return NULL;
@@ -225,11 +224,13 @@ static void *client_thread(void *arg) {
             pthread_mutex_lock(&g_mu);
             ss_entry_t *e = find_ss_nolock(ssId);
             if (!e) {
-                // Unknown server; add with unknown ports
+                // Unknown server; add with unknown ports (will not be considered UP until it REGISTERs with ports)
                 e = (ss_entry_t *)malloc(sizeof(ss_entry_t)); memset(e,0,sizeof(*e)); e->ss_id=ssId; e->ss_ctrl_port=0; e->ss_data_port=0; e->next=g_ss_list; g_ss_list=e;
             }
             int was_up = e->is_up;
-            e->last_heartbeat = time(NULL); e->is_up = 1;
+            e->last_heartbeat = time(NULL);
+            // Only mark as UP if we know its data port (i.e., it REGISTERed before/after heartbeat)
+            e->is_up = (e->ss_data_port != 0);
             pthread_mutex_unlock(&g_mu);
             if (!was_up) {
                 fprintf(stderr, "[NM] SS %d transitioned UP\n", ssId);
@@ -252,7 +253,7 @@ static void *client_thread(void *arg) {
                 const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
             }
     } else if (strcmp(type, "LOOKUP") == 0) {
-            // LOOKUP for READ/WRITE: {op:"READ"|"WRITE", file:"..."}
+            // LOOKUP for READ/WRITE and other ops that require tickets
             char op[32]; char file[128]; char user[128]; user[0]='\0';
             int have_op = (json_get_string_field(buf, "op", op, sizeof(op)) == 0);
             int have_file = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
@@ -266,15 +267,15 @@ static void *client_thread(void *arg) {
                 int ssid = 0;
                 if (nm_state_find_dir(file, &ssid) != 0) {
                     if (strcmp(op, "WRITE") == 0) {
-                        // Auto-provision mapping on first WRITE: choose first SS and ensure file exists
+                        // Auto-provision mapping on first WRITE
                         int data_port = 0; int chosen_ssid = 0; (void)pick_least_loaded_ss(&chosen_ssid, &data_port);
                         fprintf(stderr, "[NM] LOOKUP WRITE auto-provision chosen_ssid=%d data_port=%d\n", chosen_ssid, data_port);
                         if (data_port == 0) {
                             const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
+                            // fallthrough to error return
                         } else {
                             int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
-                            if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                            else {
+                            if (sfd >= 0) {
                                 char req[256]; req[0] = '\0';
                                 json_put_string_field(req, sizeof(req), "type", "CREATE", 1);
                                 json_put_string_field(req, sizeof(req), "file", file, 0);
@@ -282,8 +283,6 @@ static void *client_thread(void *arg) {
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
                                     char *r = NULL; uint32_t rl = 0;
                                     if (recv_msg(sfd, &r, &rl) == 0 && r) {
-                                        fprintf(stderr, "[NM] SS CREATE response: %.*s\n", rl, r);
-                                        // On OK or CONFLICT, set mapping
                                         if (strstr(r, "\"status\":\"OK\"") || strstr(r, "ERR_CONFLICT")) {
                                             nm_dir_set(file, chosen_ssid);
                                             nm_acl_set_owner(file, user);
@@ -293,83 +292,66 @@ static void *client_thread(void *arg) {
                                             pthread_mutex_lock(&g_mu);
                                             for (ss_entry_t *se=g_ss_list; se; se=se->next) if (se->ss_id != chosen_ssid) { if (nr < 4) repls[nr++] = se->ss_id; }
                                             pthread_mutex_unlock(&g_mu);
-                                            if (nr>0) nm_state_set_replicas(file, repls, 1); // at least one replica
+                                            if (nr>0) nm_state_set_replicas(file, repls, 1);
                                             (void)nm_state_save("nm_state.json");
                                             ssid = chosen_ssid;
                                             fprintf(stderr, "[NM] mapping set %s -> ssId=%d\n", file, ssid);
                                         }
                                     }
-                                    free(r);
+                                    if (r) free(r);
                                 }
                                 close(sfd);
-                                if (ssid == 0) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                                else {
-                                    // return endpoint for the chosen SS with a ticket
-                                    char ticket[256];
-                                    if (ticket_build(file, op, chosen_ssid, 600, ticket, sizeof(ticket)) != 0) {
-                                        const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
-                                    } else {
-                                        char resp[512];
-                                        snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"ssAddr\":\"127.0.0.1\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", data_port, ticket);
-                                        fprintf(stderr, "[NM] LOOKUP returning data_port=%d for %s (ticket issued)\n", data_port, file);
-                                        send_msg(fd, resp, (uint32_t)strlen(resp));
-                                    }
-                                }
                             }
                         }
                     } else {
-                        fprintf(stderr, "[NM] LOOKUP READ unmapped -> ERR_NOTFOUND\n");
-                        const char *resp = "{\"status\":\"ERR_NOTFOUND\"}";
-                        send_msg(fd, resp, (uint32_t)strlen(resp));
+                        const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
+                        // done
+                        goto lookup_done;
                     }
-                } else {
-                    // find ss entry, with failover if primary down
+                }
+                // Resolve data port for primary or failover to a live replica
+                {
                     int data_port = 0; int target_ssid = ssid;
                     pthread_mutex_lock(&g_mu);
-                    ss_entry_t *e = g_ss_list; while (e) { if (e->ss_id == ssid) { if (e->is_up) data_port = e->ss_data_port; break; } e = e->next; }
+                    for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->ss_id == ssid) { if (e->is_up) data_port = e->ss_data_port; break; } }
                     pthread_mutex_unlock(&g_mu);
                     if (data_port == 0) {
-                        // try replicas
                         int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
-                        for (size_t i=0;i<nr;i++) { int rp = get_data_port_for(repls[i]); int up=0; pthread_mutex_lock(&g_mu); ss_entry_t *re = find_ss_nolock(repls[i]); if (re && re->is_up) { up=1; } pthread_mutex_unlock(&g_mu); if (up && rp) { data_port = rp; target_ssid = repls[i]; break; } }
+                        for (size_t i=0;i<nr;i++) {
+                            int rp = get_data_port_for(repls[i]); int up=0; pthread_mutex_lock(&g_mu); ss_entry_t *re = find_ss_nolock(repls[i]); if (re && re->is_up) up=1; pthread_mutex_unlock(&g_mu);
+                            if (up && rp) { data_port = rp; target_ssid = repls[i]; break; }
+                        }
                         if (data_port && target_ssid != ssid) {
-                            // Promote to replica target_ssid and ensure old primary becomes a replica
                             nm_dir_set(file, target_ssid);
-                            // Build new replicas: include old primary, drop the new primary if present
                             int new_reps[16]; size_t nnr = 0;
-                            // Always include old primary as first replica
                             new_reps[nnr++] = ssid;
-                            // Keep other replicas except the new primary and duplicates
-                            for (size_t i=0;i<nr && nnr<16;i++) {
-                                if (repls[i] == target_ssid || repls[i] == ssid) continue;
-                                new_reps[nnr++] = repls[i];
-                            }
+                            for (size_t i=0;i<nr && nnr<16;i++) { if (repls[i] == target_ssid || repls[i] == ssid) continue; new_reps[nnr++] = repls[i]; }
                             nm_state_set_replicas(file, new_reps, nnr);
                             (void)nm_state_save("nm_state.json");
                             fprintf(stderr, "[NM] LOOKUP failover: promoted ssId=%d for %s; old primary %d set as replica\n", target_ssid, file, ssid);
+                            ssid = target_ssid;
                         }
                     }
                     if (data_port == 0) {
-                        const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}";
-                        send_msg(fd, resp, (uint32_t)strlen(resp));
+                        const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
                     } else {
-                        // Enforce ACL at NM before issuing ticket
                         if (nm_acl_check(file, user, op) != 0) {
                             const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                         } else {
-                        char ticket[256];
-                        if (ticket_build(file, op, target_ssid, 600, ticket, sizeof(ticket)) != 0) {
-                            const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
-                        } else {
-                            char resp[512];
-                            fprintf(stderr, "[NM] LOOKUP mapped file=%s ssId=%d data_port=%d\n", file, target_ssid, data_port);
-                            snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"ssAddr\":\"127.0.0.1\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", data_port, ticket);
-                            send_msg(fd, resp, (uint32_t)strlen(resp));
-                        }
+                            char ticket[256];
+                            if (ticket_build(file, op, ssid, 600, ticket, sizeof(ticket)) != 0) {
+                                const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
+                            } else {
+                                char resp[512];
+                                fprintf(stderr, "[NM] LOOKUP mapped file=%s ssId=%d data_port=%d\n", file, ssid, data_port);
+                                snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"ssAddr\":\"127.0.0.1\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", data_port, ticket);
+                                send_msg(fd, resp, (uint32_t)strlen(resp));
+                            }
                         }
                     }
                 }
             }
+lookup_done: ;
         } else if (strcmp(type, "CREATE") == 0) {
             char file[128]; char user[128]; user[0]='\0'; (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
             int publicRead = 0, publicWrite = 0; (void)json_get_int_field(buf, "publicRead", &publicRead); (void)json_get_int_field(buf, "publicWrite", &publicWrite);
@@ -1048,7 +1030,7 @@ static void *client_thread(void *arg) {
                 }
             }
         } else if (strcmp(type, "EXEC") == 0) {
-            // Execute file content at NM and return combined stdout
+            // Execute file content at NM with Bash and return combined stdout/stderr
             char file[128]; char user[128]; user[0]='\0';
             (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
             if (json_get_string_field(buf, "file", file, sizeof(file)) != 0) { const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -1069,13 +1051,13 @@ static void *client_thread(void *arg) {
                                     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) { send_msg(fd, r, rl); free(r);} else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } close(sfd); }
                                     else {
                                         char body[8192]; body[0]='\0'; (void)json_get_string_field(r, "body", body, sizeof(body)); free(r); close(sfd);
-                                        // Execute via /bin/sh using temp files to capture output
+                                        // Execute script verbatim via /bin/bash using temp files to capture output
                                         char tmps[512]; snprintf(tmps, sizeof(tmps), "/tmp/nm_exec_%d.sh", getpid());
                                         FILE *tf = fopen(tmps, "wb"); if (!tf) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                         else {
                                             fwrite(body, 1, strlen(body), tf); fflush(tf); fclose(tf);
                                             char tmpout[512]; snprintf(tmpout, sizeof(tmpout), "/tmp/nm_exec_%d.out", getpid());
-                                            char cmd[1100]; snprintf(cmd, sizeof(cmd), "/bin/sh '%s' > '%s' 2>&1", tmps, tmpout);
+                                            char cmd[1100]; snprintf(cmd, sizeof(cmd), "/bin/bash '%s' > '%s' 2>&1", tmps, tmpout);
                                             int rc = system(cmd);
                                             (void)rc; // even if non-zero, we capture stderr/stdout
                                             FILE *rf = fopen(tmpout, "rb");
