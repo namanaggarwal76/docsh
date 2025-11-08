@@ -821,7 +821,7 @@ int nm_acl_check(const char *file, const char *user, const char *op) {
     if (!e) return -1;
     if (e->owner && strcmp(e->owner, user)==0) return 0;
     int need;
-    if (strcmp(op, "READ") == 0 || strcmp(op, "HISTORY") == 0 || strcmp(op, "VIEWCHECKPOINT") == 0 || strcmp(op, "LISTCHECKPOINTS") == 0) need = ACL_R; // read-like
+    if (strcmp(op, "READ") == 0 || strcmp(op, "VIEWCHECKPOINT") == 0 || strcmp(op, "LISTCHECKPOINTS") == 0) need = ACL_R; // read-like
     else need = ACL_W; // WRITE/UNDO/REVERT and others require W
     for (size_t i=0;i<e->n_grants;i++){ if (strcmp(e->grants[i].user, user)==0){ if ((e->grants[i].perm & need) == need) return 0; else return -1; }}
     return -1;

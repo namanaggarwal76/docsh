@@ -1,0 +1,10 @@
+{
+  "users":["naman","manav","bebebe"],
+  "active":["naman","bebebe"],
+  "directory":{"new.txt":2,"bash.sh":2,"naman.txt":2,"manav.txt":2,"demo.txt":2},
+  "acls":{"new.txt":{"owner":"owner","grants":{"naman":"RW"}}},
+  "replicas":{"new.txt":[],"bash.sh":[1],"naman.txt":[1],"manav.txt":[1],"demo.txt":[1]},
+  "requests":{},
+  "folders":[],
+  "trash":[]
+}

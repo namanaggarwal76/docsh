@@ -260,7 +260,7 @@ static void *client_thread(void *arg) {
             (void)json_get_string_field(buf, "user", user, sizeof(user));
             if (!user[0]) snprintf(user, sizeof(user), "%s", "anonymous");
             fprintf(stderr, "[NM] LOOKUP op=%s file=%s have_op=%d have_file=%d\n", have_op?op:"?", have_file?file:"?", have_op, have_file);
-            if (!have_op || !have_file || (strcmp(op, "READ") != 0 && strcmp(op, "WRITE") != 0 && strcmp(op, "UNDO") != 0 && strcmp(op, "HISTORY") != 0 && strcmp(op, "REVERT") != 0 && strcmp(op, "CHECKPOINT") != 0 && strcmp(op, "VIEWCHECKPOINT") != 0 && strcmp(op, "LISTCHECKPOINTS") != 0)) {
+            if (!have_op || !have_file || (strcmp(op, "READ") != 0 && strcmp(op, "WRITE") != 0 && strcmp(op, "UNDO") != 0 && strcmp(op, "REVERT") != 0 && strcmp(op, "CHECKPOINT") != 0 && strcmp(op, "VIEWCHECKPOINT") != 0 && strcmp(op, "LISTCHECKPOINTS") != 0)) {
                 const char *resp = "{\"status\":\"ERR_BADREQ\"}";
                 send_msg(fd, resp, (uint32_t)strlen(resp));
             } else {

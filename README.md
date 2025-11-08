@@ -4,7 +4,7 @@
 
 This repository implements a Docs++ system with three components:
 - Name Manager (NM): routing, ACL enforcement, replication orchestration, persistence
-- Storage Server (SS): file storage, sentence-level WRITE with atomic commits, UNDO, checkpoints, history
+- Storage Server (SS): file storage, sentence-level WRITE with atomic commits, UNDO, checkpoints
 - Client (CLI): interactive shell with user-aware authorization
 
 Build
@@ -58,7 +58,7 @@ Then start a client shell (you’ll be prompted for username):
 - CHECKPOINT <file> <name>
 - VIEWCHECKPOINT <file> <name>
 - LISTCHECKPOINTS <file>
-- REVERT <file> <version|checkpointName>
+- REVERT <file> <checkpointName>
 - CLEAR
 - EXIT
 
@@ -109,7 +109,7 @@ CHECKPOINT demo.txt snap1
 LISTCHECKPOINTS demo.txt
 VIEWCHECKPOINT demo.txt snap1
 REVERT demo.txt snap1      # name
-REVERT demo.txt 1          # or version
+REVERT demo.txt snap1      # revert again (checkpoint only)
 ```
 
 5) Folders and moves
@@ -161,7 +161,6 @@ EMPTYTRASH demo.txt  # purge one file
 - Storage Server (SS) data: each SS writes under `ss_data/ss<ID>/` inside the repo:
   - `files/` current file contents
   - `undo/` single-level undo snapshots
-  - `history/` version snapshots
   - `checkpoints/` named checkpoints per file
   - `meta/` reserved
 

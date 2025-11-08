@@ -168,18 +168,14 @@ static void print_human(const char *who, const char *json) {
     char status[64]; status[0]='\0';
     (void)json_get_string_field(json, "status", status, sizeof(status));
     if (strcmp(status, "OK") == 0) {
-        // Common OK shapes: may include body/versions/etc.
+    // Common OK shapes: may include body/checkpoints/etc.
         char body[8192];
         if (json_get_string_field(json, "body", body, sizeof(body)) == 0) {
             // READ-like
             printf("%s\n", body);
             return;
         }
-        // HISTORY: versions list
-        if (strstr(json, "\"versions\":")) {
-            printf("OK: versions listed\n");
-            return;
-        }
+        // HISTORY removed: versions list no longer emitted
         // VIEWREQUESTS: requests list
         if (strstr(json, "\"requests\":")) {
             if (color) printf("%sRequests:%s\n", C, Z); else printf("Requests:\n");
@@ -384,7 +380,7 @@ static void print_human(const char *who, const char *json) {
     }
     // Errors: map to human messages (avoid dumping raw JSON)
     if (strcmp(status, "ERR_NOTFOUND") == 0) {
-        if (color) printf("%sERROR:%s resource not found (file/checkpoint/version may not exist)\n", R, Z); else printf("ERROR: resource not found (file/checkpoint/version may not exist)\n"); return;
+    if (color) printf("%sERROR:%s resource not found (file or checkpoint may not exist)\n", R, Z); else printf("ERROR: resource not found (file or checkpoint may not exist)\n"); return;
     } else if (strcmp(status, "ERR_NOAUTH") == 0) {
         if (color) printf("%sERROR:%s permission denied (request access or contact owner)\n", R, Z); else printf("ERROR: permission denied (request access or contact owner)\n"); return;
     } else if (strcmp(status, "ERR_CONFLICT") == 0) {
