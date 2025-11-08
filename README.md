@@ -41,6 +41,9 @@ Then start a client shell (you’ll be prompted for username):
 - UNDO <file>
 - INFO <file>
 - DELETE <file>
+- LISTTRASH
+- RESTORE <file>
+- EMPTYTRASH [<file>]
 - STREAM <file>
 - LIST (active users)
 - ADDACCESS -R|-W <file> <user>
@@ -134,6 +137,24 @@ EXEC tools/diag.sh
 # Output will be combined stdout/stderr from /bin/bash with no special-casing.
 ```
 
+7) Trash can (soft delete)
+```bash
+# Delete moves the file to a hidden trash namespace on the SS and records it in NM state
+DELETE demo.txt
+
+# List trashed items
+LISTTRASH
+
+# Restore a specific file (only the owner may restore)
+RESTORE demo.txt
+
+# Empty trash
+# - Without an argument: purge all trashed items owned by you
+# - With a file: purge only that file from trash
+EMPTYTRASH           # purge all your trashed files
+EMPTYTRASH demo.txt  # purge one file
+```
+
 ## Data locations
 
 - Name Manager (NM) state: `nm_state.json` at repo root. It stores users, directory mapping, ACLs, replicas, folders, and pending requests.
@@ -167,6 +188,15 @@ The client prints human-readable errors and does not dump raw JSON. Some errors 
   - Causes: filesystem errors (permissions, disk), rename/write failures, or unhandled server-side conditions.
 - Network/transport errors
   - Examples: failed to connect/send/receive to NM/SS. Usually indicates the service is down or a transient network issue.
+
+## Colorized terminal output
+
+The client prints colored output when stdout is a TTY:
+- Green OK on success
+- Red ERROR on failures
+- Cyan section headers (e.g., requests)
+
+Set NO_COLOR=1 to disable colors (or when piping output).
 
 ## Replication and failover (overview)
 

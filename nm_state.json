@@ -1,9 +1,0 @@
-{
-  "users":["naman","manav","arnav","hemang"],
-  "active":["naman","manav"],
-  "directory":{"NAMAN":1,"bhosda.txt":1,"c.tct":1,"bash.sh":1,"new.txt":1,"new/b1.txt":1,"a2.txt":1,"newww.txt":1,"baash.sh":1,"test/testing.txt":1,"hello.txt":1},
-  "acls":{"NAMAN":{"owner":"owner","grants":{"naman":"RW","manav":"RW"}},"test/testing.txt":{"owner":"naman","grants":{"naman":"RW"}},"hello.txt":{"owner":"naman","grants":{"naman":"RW","manav":"RW"}}},
-  "replicas":{"NAMAN":[2],"bhosda.txt":[2],"c.tct":[2],"bash.sh":[2],"new.txt":[2],"new/b1.txt":[],"a2.txt":[],"newww.txt":[2],"baash.sh":[2],"test/testing.txt":[2],"hello.txt":[2]},
-  "requests":{"NAMAN":[{"user":"manav","mode":"R"}],"a2.txt":[{"user":"naman","mode":"W"},{"user":"hemang","mode":"R"},{"user":"arnav","mode":"R"}],"hello.txt":[]},
-  "folders":["NAMAN/","new","test"]
-}

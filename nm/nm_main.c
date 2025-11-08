@@ -399,62 +399,43 @@ lookup_done: ;
                 }
             }
         } else if (strcmp(type, "DELETE") == 0) {
+            // Soft delete: move file to .trash and record in NM state
             char file[128]; char user[128]; user[0]='\0';
-            (void)json_get_string_field(buf, "user", user, sizeof(user));
-            if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
-            if (json_get_string_field(buf, "file", file, sizeof(file)) != 0) {
-                const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-            } else {
-                int ssid = 0;
-                if (nm_state_find_dir(file, &ssid) != 0) {
-                    const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-                } else {
-                        // Owner-only delete: require requester to be the owner
-                        char owner[128]; owner[0]='\0';
-                        if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) {
-                        const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-                    } else {
-                        pthread_mutex_lock(&g_mu);
-                        ss_entry_t *e = g_ss_list; int data_port = 0;
-                        while (e) { if (e->ss_id == ssid) { data_port = e->ss_data_port; break; } e = e->next; }
-                        pthread_mutex_unlock(&g_mu);
-                        if (data_port == 0) {
-                            const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-                        } else {
+            (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
+            if (json_get_string_field(buf, "file", file, sizeof(file)) != 0) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+            else {
+                int ssid = 0; if (nm_state_find_dir(file, &ssid) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char owner[128]; owner[0]='\0'; if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        int data_port = 0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if (e->ss_id==ssid) { data_port = e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
+                        if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        else {
+                            // Build trashed path: .trash/<epoch>_<escaped_original>
+                            time_t now = time(NULL);
+                            char esc[200]; size_t k=0; for (const char *p=file; *p && k<sizeof(esc)-1; ++p) { esc[k++] = (*p=='/'? '_': *p); } esc[k]='\0';
+                            char tpath[256]; snprintf(tpath, sizeof(tpath), ".trash/%ld_%s", (long)now, esc);
+                            // Issue RENAME on SS
                             int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
-                            if (sfd < 0) {
-                                const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-                            } else {
-                                char req[256]; req[0] = '\0';
-                                json_put_string_field(req, sizeof(req), "type", "DELETE", 1);
-                                json_put_string_field(req, sizeof(req), "file", file, 0);
-                                strncat(req, "}", sizeof(req) - strlen(req) - 1);
-                                if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
-                                    char *r = NULL; uint32_t rl=0;
-                                    if (recv_msg(sfd, &r, &rl) == 0 && r) {
-                                        if (strstr(r, "\"status\":\"OK\"")) {
-                                            nm_dir_del(file);
-                                                // Clean up ACLs and pending requests for the deleted file
-                                                nm_acl_delete(file);
-                                                nm_state_clear_requests_for(file);
-                                            // replicate delete to replicas
-                                            int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
-                                            for (size_t i=0;i<nr;i++) schedule_cmd_repl("DELETE", file, NULL, repls[i]);
-                                            (void)nm_state_save("nm_state.json");
-                                            const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
-                                        } else if (strstr(r, "ERR_NOTFOUND")) {
-                                            const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er));
-                                        } else {
-                                            const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
-                                        }
-                                    } else {
-                                        const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er));
+                            if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                            else {
+                                char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "RENAME", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "newFile", tpath, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                                if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                else {
+                                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r) { close(sfd); const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                    else if (!strstr(r, "\"status\":\"OK\"")) { send_msg(fd, r, rl); free(r); close(sfd); }
+                                    else {
+                                        free(r); close(sfd);
+                                        // Replicate rename to replicas (best-effort)
+                                        int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                                        for (size_t i=0;i<nr;i++) schedule_cmd_repl("RENAME", file, tpath, repls[i]);
+                                        // Remove mapping and ACLs, add to trash state
+                                        nm_dir_del(file); nm_acl_delete(file); nm_state_clear_requests_for(file);
+                                        nm_state_trash_add(file, tpath, ssid, owner, (int)now);
+                                        (void)nm_state_save("nm_state.json");
+                                        const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                     }
-                                    free(r);
-                                } else {
-                                    const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                                 }
-                                close(sfd);
                             }
                         }
                     }
@@ -910,6 +891,77 @@ lookup_done: ;
             int q = repq_get(); int locks = -1;
             char resp[256]; snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"files\":%zu,\"activeLocks\":%d,\"replicationQueue\":%d}", nf, locks, q);
             send_msg(fd, resp, (uint32_t)strlen(resp));
+        } else if (strcmp(type, "LISTTRASH") == 0) {
+            // List trashed items
+            char files[256][128]; char trashed[256][128]; int ssids[256]; char owners[256][128]; int whens[256];
+            size_t n = nm_state_get_trash(files, trashed, ssids, owners, whens, 256);
+            char resp[16384]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"trash\":[");
+            for (size_t i=0;i<n;i++) {
+                if (i) w += snprintf(resp+w, sizeof(resp)-w, ",");
+                w += snprintf(resp+w, sizeof(resp)-w, "{\"file\":\"%s\",\"trashed\":\"%s\",\"owner\":\"%s\",\"ssid\":%d,\"when\":%d}", files[i], trashed[i], owners[i], ssids[i], whens[i]);
+                if (w >= sizeof(resp)) break;
+            }
+            if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
+            send_msg(fd, resp, (uint32_t)strlen(resp));
+        } else if (strcmp(type, "RESTORE") == 0) {
+            // Restore a trashed file back to original path; owner-only
+            char file[128]; char user[128]; user[0]='\0';
+            (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
+            if (json_get_string_field(buf, "file", file, sizeof(file)) != 0) { const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else if (nm_state_find_dir(file, NULL) == 0) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                char tpath[128]; int ssid=0; char owner[128]; int when=0; owner[0]='\0'; tpath[0]='\0';
+                if (nm_state_trash_find(file, tpath, sizeof(tpath), &ssid, owner, sizeof(owner), &when) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else if (owner[0] && strcmp(owner, user) != 0) { const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    // RENAME back on SS
+                    int data_port=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if (e->ss_id==ssid){ data_port=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
+                    if (data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                    else {
+                        int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                        if (sfd < 0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                        else {
+                            char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "RENAME", 1); json_put_string_field(req, sizeof(req), "file", tpath, 0); json_put_string_field(req, sizeof(req), "newFile", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                            if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                            else {
+                                char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r) { close(sfd); const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                else if (!strstr(r, "\"status\":\"OK\"")) { send_msg(fd, r, rl); free(r); close(sfd); }
+                                else {
+                                    free(r); close(sfd);
+                                    // Recreate mapping and owner ACL
+                                    nm_state_trash_remove(file);
+                                    nm_dir_set(file, ssid);
+                                    if (owner[0]) { nm_acl_set_owner(file, owner); nm_acl_grant(file, owner, ACL_R|ACL_W); }
+                                    (void)nm_state_save("nm_state.json");
+                                    const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (strcmp(type, "EMPTYTRASH") == 0) {
+            // Permanently delete trashed files; if 'file' provided, purge only that entry; otherwise purge all owned by 'user'
+            char user[128]; user[0]='\0'; (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
+            char target[128]; int has_file = (json_get_string_field(buf, "file", target, sizeof(target)) == 0);
+            // Iterate over trash entries safely by snapshot
+            char files[256][128]; char trashed[256][128]; int ssids[256]; char owners[256][128]; int whens[256];
+            size_t n = nm_state_get_trash(files, trashed, ssids, owners, whens, 256);
+            int purged = 0;
+            for (size_t i=0;i<n;i++) {
+                if (has_file) { if (strcmp(files[i], target) != 0) continue; }
+                else { if (owners[i][0] && strcmp(owners[i], user) != 0) continue; }
+                // Delete on SS
+                int data_port=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if (e->ss_id==ssids[i]) { data_port=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
+                if (data_port==0) continue;
+                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) continue;
+                char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "DELETE", 1); json_put_string_field(req, sizeof(req), "file", trashed[i], 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) { char *r=NULL; uint32_t rl=0; (void)recv_msg(sfd, &r, &rl); if (r) free(r); }
+                close(sfd);
+                nm_state_trash_remove(files[i]); purged++;
+            }
+            (void)nm_state_save("nm_state.json");
+            const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
         } else if (strcmp(type, "VIEW") == 0) {
             // flags: -a (all), -l (details). Default: only files user can READ.
             char flags[32]; flags[0]='\0'; char user[128]; user[0]='\0';
