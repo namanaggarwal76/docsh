@@ -113,4 +113,17 @@ int nm_state_remove_request(const char *file, const char *user);
 // Remove all pending requests for a file
 int nm_state_clear_requests_for(const char *file);
 
+// --- Trash (soft delete) ---
+// Add a trashed entry with original file, trashed storage path, ssid, owner and time (epoch seconds)
+int nm_state_trash_add(const char *file, const char *trashed_path, int ssid, const char *owner, int when);
+
+// Remove a trashed entry by original file name; returns 1 if removed
+int nm_state_trash_remove(const char *file);
+
+// Find a trashed entry by original file; returns 0 on success and fills outputs
+int nm_state_trash_find(const char *file, char *trashed_out, size_t trashed_out_sz, int *ssid_out, char *owner_out, size_t owner_out_sz, int *when_out);
+
+// Snapshot trash into caller-provided fixed arrays; returns number of entries
+size_t nm_state_get_trash(char files[][128], char trashed[][128], int ssids[], char owners[][128], int whens[], size_t max_entries);
+
 #endif // NM_PERSIST_H

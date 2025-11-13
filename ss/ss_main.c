@@ -33,10 +33,20 @@ typedef struct lock_node {
 static lock_node_t *g_locks = NULL;
 static pthread_mutex_t g_lock_mu = PTHREAD_MUTEX_INITIALIZER;
 
+// Forward declaration (defined later in file)
+static void ensure_parent_dirs_for(const char *path);
+
+// Snapshot-based read isolation removed; readers always see the latest committed file.
+
 static int lock_acquire(const char *file, int sidx) {
     pthread_mutex_lock(&g_lock_mu);
     for (lock_node_t *n = g_locks; n; n = n->next) {
         if (n->sentence_idx == sidx && strcmp(n->file, file) == 0) {
+            // Debug: log current locks when denying
+            fprintf(stderr, "[SS] lock_acquire DENY file=%s sidx=%d (existing lock)\n", file, sidx);
+            for (lock_node_t *m = g_locks; m; m = m->next) {
+                fprintf(stderr, "[SS]   held: file=%s sidx=%d\n", m->file, m->sentence_idx);
+            }
             pthread_mutex_unlock(&g_lock_mu);
             return -1; // already locked
         }
@@ -74,7 +84,6 @@ static void ensure_dirs(void) {
     snprintf(p, sizeof(p), "%s/files", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/meta", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/undo", g_store_root); mkdir(p, 0755);
-    snprintf(p, sizeof(p), "%s/history", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/checkpoints", g_store_root); mkdir(p, 0755);
 }
 
@@ -153,40 +162,7 @@ typedef struct conn_write_session {
     size_t pre_image_len;
 } conn_write_session_t;
 
-// Helpers for M9 history
-static int history_next_index(const char *file) {
-    // Scan history dir for files named "<file>.<num>.snap" and return max(num)+1
-    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
-    int next = 1;
-    DIR *d = opendir(dpath);
-    if (!d) return next;
-    size_t flen = strlen(file);
-    struct dirent *de;
-    while ((de = readdir(d)) != NULL) {
-        const char *name = de->d_name;
-        if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-            const char *rest = name + flen + 1; // starts with number
-            char *endptr = NULL;
-            long val = strtol(rest, &endptr, 10);
-            if (endptr && strcmp(endptr, ".snap") == 0 && val > 0) {
-                if (val + 1 > next) next = (int)val + 1;
-            }
-        }
-    }
-    closedir(d);
-    return next;
-}
-
-static void history_save_snapshot(const char *file, const void *data, size_t len) {
-    if (!file) return;
-    int idx = history_next_index(file);
-    char hpath[SS_PATH_MAX]; snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, idx);
-    FILE *hf = fopen(hpath, "wb");
-    if (!hf) { perror("[SS] history fopen"); return; }
-    if (data && len > 0) fwrite(data, 1, len, hf);
-    fflush(hf); fclose(hf);
-    fprintf(stderr, "[SS] history snapshot saved: %s (len=%zu)\n", hpath, len);
-}
+// History feature removed: checkpoints + single-level UNDO remain.
 
 // Per-connection handler to allow concurrent clients (top-level C function)
 typedef struct { int cfd; } conn_args_t;

@@ -4,7 +4,7 @@
 
 This repository implements a Docs++ system with three components:
 - Name Manager (NM): routing, ACL enforcement, replication orchestration, persistence
-- Storage Server (SS): file storage, sentence-level WRITE with atomic commits, UNDO, checkpoints, history
+- Storage Server (SS): file storage, sentence-level WRITE with atomic commits, UNDO, checkpoints
 - Client (CLI): interactive shell with user-aware authorization
 
 Build
@@ -41,6 +41,9 @@ Then start a client shell (you’ll be prompted for username):
 - UNDO <file>
 - INFO <file>
 - DELETE <file>
+- LISTTRASH
+- RESTORE <file>
+- EMPTYTRASH [<file>]
 - STREAM <file>
 - LIST (active users)
 - ADDACCESS -R|-W <file> <user>
@@ -55,7 +58,7 @@ Then start a client shell (you’ll be prompted for username):
 - CHECKPOINT <file> <name>
 - VIEWCHECKPOINT <file> <name>
 - LISTCHECKPOINTS <file>
-- REVERT <file> <version|checkpointName>
+- REVERT <file> <checkpointName>
 - CLEAR
 - EXIT
 
@@ -106,7 +109,7 @@ CHECKPOINT demo.txt snap1
 LISTCHECKPOINTS demo.txt
 VIEWCHECKPOINT demo.txt snap1
 REVERT demo.txt snap1      # name
-REVERT demo.txt 1          # or version
+REVERT demo.txt snap1      # revert again (checkpoint only)
 ```
 
 5) Folders and moves
@@ -119,41 +122,83 @@ MOVE docs/note.txt docs/notes.txt
 RENAME docs/notes.txt docs/todo.txt
 ```
 
+6) Execute scripts via NM
+```bash
+# Save a bash script into a file (via WRITE) and then execute it at the NM
+WRITE tools/diag.sh 0
+# enter lines:
+# echo "Running diagnostics..."
+# uname -a
+# ls -la
+# echo "Done!"
+ETIRW
+
+EXEC tools/diag.sh
+# Output will be combined stdout/stderr from /bin/bash with no special-casing.
+```
+
+7) Trash can (soft delete)
+```bash
+# Delete moves the file to a hidden trash namespace on the SS and records it in NM state
+DELETE demo.txt
+
+# List trashed items
+LISTTRASH
+
+# Restore a specific file (only the owner may restore)
+RESTORE demo.txt
+
+# Empty trash
+# - Without an argument: purge all trashed items owned by you
+# - With a file: purge only that file from trash
+EMPTYTRASH           # purge all your trashed files
+EMPTYTRASH demo.txt  # purge one file
+```
+
 ## Data locations
 
 - Name Manager (NM) state: `nm_state.json` at repo root. It stores users, directory mapping, ACLs, replicas, folders, and pending requests.
 - Storage Server (SS) data: each SS writes under `ss_data/ss<ID>/` inside the repo:
   - `files/` current file contents
   - `undo/` single-level undo snapshots
-  - `history/` version snapshots
   - `checkpoints/` named checkpoints per file
   - `meta/` reserved
 
 You can run multiple SS from the same working directory; their data is kept separate by `ss<ID>`.
+
+## Error messages and common causes
+
+The client prints human-readable errors and does not dump raw JSON. Some errors include extra details from the server (msg).
+
+- ERROR: resource not found
+  - Causes: file doesn’t exist; checkpoint/tag not found; undo snapshot missing.
+- ERROR: permission denied
+  - Causes: you don’t have R/W access; request access or ask the owner; invalid/expired ticket.
+- ERROR: conflict
+  - Causes: creating a file that already exists; renaming to an existing target; conflicting operation.
+- ERROR: sentence locked by another writer; try again later
+  - Causes: another WRITE session holds a lock on the same sentence index.
+- ERROR: service unavailable (no storage server reachable)
+  - Causes: no SS registered or reachable; NM couldn’t map the file to a live SS.
+- ERROR: bad request (invalid arguments/index or wrong sequence)
+  - Causes: missing fields, non-numeric or out-of-range indices, APPLY without an active session, or other invalid input.
+  - Details may include: missing-fields, invalid-index-or-content, session-active.
+- ERROR: internal server error (I/O failure or unexpected state)
+  - Causes: filesystem errors (permissions, disk), rename/write failures, or unhandled server-side conditions.
+- Network/transport errors
+  - Examples: failed to connect/send/receive to NM/SS. Usually indicates the service is down or a transient network issue.
+
+## Colorized terminal output
+
+The client prints colored output when stdout is a TTY:
+- Green OK on success
+- Red ERROR on failures
+- Cyan section headers (e.g., requests)
+
+Set NO_COLOR=1 to disable colors (or when piping output).
 
 ## Replication and failover (overview)
 
 - NM tracks SS heartbeats. If a primary goes down, a live replica is promoted and the old primary is kept as a replica for later resync.
 - On commit, SS notifies NM; NM replicates the update asynchronously (non-blocking) via PUT to replicas.
 - When an SS comes back up, NM resynchronizes files where it is a replica.
-
-## Tips
-
-- Error messages map to human messages in the CLI (e.g., permission denied, not found).
-- CLEAR clears the screen; EXIT/quit leaves the client and marks the user inactive.
-
-## Removed commands (client-only)
-
-These legacy or admin/debug commands were removed from the client CLI. Server-side logic/helpers were not changed.
-
-- dir-set (deprecated; no replacement)
-- lookup-read (deprecated; use READ)
-- read-noticket (insecure variant; use READ)
-- migrate (internal/testing)
-- put-direct (internal/testing)
-- history (replaced by LISTCHECKPOINTS/VIEWCHECKPOINT if you need snapshots)
-- approve_access / deny_access (admin-only; consolidated workflow via REQUEST_ACCESS/VIEWREQUESTS for transparency)
-- stats (internal)
-- revertc (internal/testing)
-- hello (internal/testing)
-- Aliases removed: mkdir → CREATEFOLDER, lsf → VIEWFOLDER, mv → MOVE. Use canonical names above (case-insensitive).

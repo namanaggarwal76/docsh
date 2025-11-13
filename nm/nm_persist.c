@@ -32,6 +32,10 @@ typedef struct {
     struct req_entry { char *file; char **users; char *modes; size_t n_users; size_t cap_users; } *requests;
     size_t n_requests;
     size_t cap_requests;
+    // Trash entries (soft-deleted files tracked at NM)
+    struct trash_entry { char *file; char *trashed; int ssid; char *owner; int when; } *trash;
+    size_t n_trash;
+    size_t cap_trash;
 } nm_state_t;
 
 static nm_state_t g_state;
@@ -149,8 +153,8 @@ static int write_atomic(const char *path, const char *data, size_t len) {
 }
 
 int nm_state_save(const char *path) {
-    // Compose JSON: users, directory, acls, replicas, requests, folders
-    size_t bufcap = 8192 + (g_state.n_users + g_state.n_active) * 64 + g_state.n_dir * 160 + g_state.n_acls * 320 + g_state.n_folders * 64;
+    // Compose JSON: users, directory, acls, replicas, requests, folders, trash
+    size_t bufcap = 16384 + (g_state.n_users + g_state.n_active) * 64 + g_state.n_dir * 160 + g_state.n_acls * 320 + g_state.n_folders * 64 + g_state.n_trash * 256;
     char *buf = (char *)malloc(bufcap);
     if (!buf) return -1;
     buf[0] = '\0';
@@ -257,6 +261,20 @@ int nm_state_save(const char *path) {
         const char *s = g_state.folders[i];
         for (; s && *s; ++s) { if (*s == '"' || *s == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}        
         strcat(buf, "\"");
+    }
+    strcat(buf, "],\n  \"trash\":[");
+    for (size_t i=0;i<g_state.n_trash;i++) {
+        if (i) strcat(buf, ",");
+        strcat(buf, "{\"file\":\"");
+        const char *s = g_state.trash[i].file; for (; s && *s; ++s) { if (*s=='"' || *s=='\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}        
+        strcat(buf, "\",\"trashed\":\"");
+        s = g_state.trash[i].trashed; for (; s && *s; ++s) { if (*s=='"' || *s=='\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}        
+        strcat(buf, "\",\"owner\":\"");
+        s = g_state.trash[i].owner; for (; s && *s; ++s) { if (*s=='"' || *s=='\\') strncat(buf, "\\", bufcap - strlen(buf) - 1); char ch[2] = {*s,0}; strncat(buf, ch, bufcap - strlen(buf) - 1);}        
+        strcat(buf, "\",\"ssid\":");
+        char num[64]; snprintf(num, sizeof(num), "%d", g_state.trash[i].ssid); strncat(buf, num, bufcap - strlen(buf) - 1);
+        strcat(buf, ",\"when\":"); snprintf(num, sizeof(num), "%d", g_state.trash[i].when); strncat(buf, num, bufcap - strlen(buf) - 1);
+        strcat(buf, "}");
     }
     strcat(buf, "]\n}\n");
 
@@ -444,8 +462,149 @@ int nm_state_load(const char *path) {
     parse_requests_object(buf);
     // Parse folders
     parse_folders_array(buf);
+    // Parse trash (optional)
+    const char *tp = strstr(buf, "\"trash\"");
+    if (tp) {
+        const char *arr = strchr(tp, '[');
+        if (arr) {
+            arr++;
+            while (*arr) {
+                while (*arr==' '||*arr=='\n'||*arr=='\t'||*arr==',') arr++;
+                if (*arr==']') break;
+                if (*arr!='{') break;
+                arr++;
+                char of[256]={0}, tr[256]={0}, owner[128]={0};
+                int ssid=0, when=0;
+                const char *obj = arr;
+                while (*obj && *obj!='}') {
+                    while (*obj==' '||*obj=='\n'||*obj=='\t'||*obj==',') obj++;
+                    if (*obj!='"') { while(*obj && *obj!=',' && *obj!='}') obj++; if (*obj==',') obj++; continue; }
+                    obj++;
+                    const char *ks=obj; while(*obj && *obj!='"'){ if(*obj=='\\'&&obj[1]) obj+=2; else obj++; }
+                    size_t klen=(size_t)(obj-ks); char key[16]; size_t ki=0; const char *ps=ks; while(ki<klen&&*ps){ if(*ps=='\\'&&ps[1]){ps++; key[ki++]=*ps++;} else key[ki++]=*ps++; } key[ki]='\0';
+                    if (*obj=='"') obj++;
+                    while (*obj && *obj!=':') obj++;
+                    if (*obj==':') obj++;
+                    while (*obj==' '||*obj=='\n'||*obj=='\t') obj++;
+                    if (strcmp(key, "file")==0 && *obj=='"') {
+                        obj++; const char *vs=obj; while(*obj && *obj!='"'){ if(*obj=='\\'&&obj[1]) obj+=2; else obj++; }
+                        size_t vlen=(size_t)(obj-vs); size_t j=0; const char *s=vs; while(j<vlen&&*s){ if(*s=='\\'&&s[1]){s++; of[j++]=*s++;} else of[j++]=*s++; } of[j]='\0';
+                        if (*obj=='"') obj++;
+                    } else if (strcmp(key, "trashed")==0 && *obj=='"') {
+                        obj++; const char *vs=obj; while(*obj && *obj!='"'){ if(*obj=='\\'&&obj[1]) obj+=2; else obj++; }
+                        size_t vlen=(size_t)(obj-vs); size_t j=0; const char *s=vs; while(j<vlen&&*s){ if(*s=='\\'&&s[1]){s++; tr[j++]=*s++;} else tr[j++]=*s++; } tr[j]='\0';
+                        if (*obj=='"') obj++;
+                    } else if (strcmp(key, "owner")==0 && *obj=='"') {
+                        obj++; const char *vs=obj; while(*obj && *obj!='"'){ if(*obj=='\\'&&obj[1]) obj+=2; else obj++; }
+                        size_t vlen=(size_t)(obj-vs); size_t j=0; const char *s=vs; while(j<vlen&&*s){ if(*s=='\\'&&s[1]){s++; owner[j++]=*s++;} else owner[j++]=*s++; } owner[j]='\0';
+                        if (*obj=='"') obj++;
+                    } else if (strcmp(key, "ssid")==0) {
+                        const char *vs=obj; while(*obj && *obj!=',' && *obj!='}') obj++; char nb[32]; size_t n=(size_t)(obj-vs); if(n>=sizeof(nb)) n=sizeof(nb)-1; memcpy(nb,vs,n); nb[n]='\0'; ssid=atoi(nb);
+                    } else if (strcmp(key, "when")==0) {
+                        const char *vs=obj; while(*obj && *obj!=',' && *obj!='}') obj++; char nb[32]; size_t n=(size_t)(obj-vs); if(n>=sizeof(nb)) n=sizeof(nb)-1; memcpy(nb,vs,n); nb[n]='\0'; when=atoi(nb);
+                    } else {
+                        while(*obj && *obj!=',' && *obj!='}') obj++;
+                    }
+                    if (*obj==',') obj++;
+                }
+                if (*obj=='}') {
+                    if (of[0] && tr[0]) nm_state_trash_add(of, tr, ssid, owner[0]?owner:NULL, when);
+                    obj++;
+                }
+                arr = obj; while (*arr && *arr!=',' && *arr!=']') arr++; if (*arr==',') arr++;
+            }
+        }
+    }
     free(buf);
     return 0;
+}
+
+// ---- Trash APIs ----
+static void ensure_trash_cap(size_t need) {
+    if (g_state.cap_trash >= need) return;
+    size_t nc = g_state.cap_trash ? g_state.cap_trash * 2 : 8;
+    while (nc < need) nc *= 2;
+    struct trash_entry *p = (struct trash_entry *)realloc(g_state.trash, nc * sizeof(*g_state.trash));
+    if (!p) return;
+    g_state.trash = p; g_state.cap_trash = nc;
+}
+
+int nm_state_trash_add(const char *file, const char *trashed_path, int ssid, const char *owner, int when) {
+    if (!file || !*file || !trashed_path || !*trashed_path) return 0;
+    // If exists, replace
+    for (size_t i=0;i<g_state.n_trash;i++) {
+        if (strcmp(g_state.trash[i].file, file)==0) {
+            if (g_state.trash[i].trashed) free(g_state.trash[i].trashed);
+            g_state.trash[i].trashed = strdup(trashed_path);
+            g_state.trash[i].ssid = ssid;
+            if (g_state.trash[i].owner) free(g_state.trash[i].owner);
+            g_state.trash[i].owner = owner && *owner ? strdup(owner) : NULL;
+            g_state.trash[i].when = when;
+            return 1;
+        }
+    }
+    ensure_trash_cap(g_state.n_trash + 1);
+    if (g_state.cap_trash < g_state.n_trash + 1) return 0;
+    struct trash_entry *e = &g_state.trash[g_state.n_trash++];
+    e->file = strdup(file);
+    e->trashed = strdup(trashed_path);
+    e->ssid = ssid;
+    e->owner = (owner && *owner) ? strdup(owner) : NULL;
+    e->when = when;
+    return 1;
+}
+
+int nm_state_trash_remove(const char *file) {
+    if (!file || !*file) return 0;
+    for (size_t i=0;i<g_state.n_trash;i++) {
+        if (strcmp(g_state.trash[i].file, file)==0) {
+            if (g_state.trash[i].file) free(g_state.trash[i].file);
+            if (g_state.trash[i].trashed) free(g_state.trash[i].trashed);
+            if (g_state.trash[i].owner) free(g_state.trash[i].owner);
+            if (i != g_state.n_trash-1) g_state.trash[i] = g_state.trash[g_state.n_trash-1];
+            g_state.n_trash--;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int nm_state_trash_find(const char *file, char *trashed_out, size_t trashed_out_sz, int *ssid_out, char *owner_out, size_t owner_out_sz, int *when_out) {
+    if (trashed_out && trashed_out_sz) {
+        trashed_out[0] = '\0';
+    }
+    if (owner_out && owner_out_sz) {
+        owner_out[0] = '\0';
+    }
+    if (ssid_out) {
+        *ssid_out = 0;
+    }
+    if (when_out) {
+        *when_out = 0;
+    }
+    for (size_t i=0;i<g_state.n_trash;i++) {
+        if (strcmp(g_state.trash[i].file, file)==0) {
+            if (trashed_out && trashed_out_sz) snprintf(trashed_out, trashed_out_sz, "%s", g_state.trash[i].trashed?g_state.trash[i].trashed:"");
+            if (ssid_out) *ssid_out = g_state.trash[i].ssid;
+            if (owner_out && owner_out_sz) snprintf(owner_out, owner_out_sz, "%s", g_state.trash[i].owner?g_state.trash[i].owner:"");
+            if (when_out) *when_out = g_state.trash[i].when;
+            return 0;
+        }
+    }
+    return -1;
+}
+
+size_t nm_state_get_trash(char files[][128], char trashed[][128], int ssids[], char owners[][128], int whens[], size_t max_entries) {
+    size_t c = 0;
+    for (size_t i=0;i<g_state.n_trash && c < max_entries; ++i) {
+        snprintf(files[c], 128, "%s", g_state.trash[i].file);
+        snprintf(trashed[c], 128, "%s", g_state.trash[i].trashed?g_state.trash[i].trashed:"");
+        ssids[c] = g_state.trash[i].ssid;
+        if (owners) snprintf(owners[c], 128, "%s", g_state.trash[i].owner?g_state.trash[i].owner:"");
+        if (whens) whens[c] = g_state.trash[i].when;
+        c++;
+    }
+    return c;
 }
 
 static void ensure_dir_cap(size_t need) {
@@ -662,7 +821,7 @@ int nm_acl_check(const char *file, const char *user, const char *op) {
     if (!e) return -1;
     if (e->owner && strcmp(e->owner, user)==0) return 0;
     int need;
-    if (strcmp(op, "READ") == 0 || strcmp(op, "HISTORY") == 0 || strcmp(op, "VIEWCHECKPOINT") == 0 || strcmp(op, "LISTCHECKPOINTS") == 0) need = ACL_R; // read-like
+    if (strcmp(op, "READ") == 0 || strcmp(op, "VIEWCHECKPOINT") == 0 || strcmp(op, "LISTCHECKPOINTS") == 0) need = ACL_R; // read-like
     else need = ACL_W; // WRITE/UNDO/REVERT and others require W
     for (size_t i=0;i<e->n_grants;i++){ if (strcmp(e->grants[i].user, user)==0){ if ((e->grants[i].perm & need) == need) return 0; else return -1; }}
     return -1;
