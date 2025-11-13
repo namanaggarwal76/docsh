@@ -10,6 +10,12 @@
 				"$gcc"
 			],
 			"group": "build"
+		},
+		{
+			"label": "build-all",
+			"type": "shell",
+			"command": "make",
+			"group": "build"
 		}
 	]
 }

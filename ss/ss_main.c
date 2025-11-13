@@ -188,6 +188,579 @@ static void history_save_snapshot(const char *file, const void *data, size_t len
     fprintf(stderr, "[SS] history snapshot saved: %s (len=%zu)\n", hpath, len);
 }
 
+// Per-connection handler to allow concurrent clients (top-level C function)
+typedef struct { int cfd; } conn_args_t;
+static void *ss_conn_handler(void *varg) {
+    conn_args_t *ca = (conn_args_t *)varg;
+    int cfd = ca->cfd;
+    free(ca);
+    fprintf(stderr, "[SS] accept cfd=%d\n", cfd); fflush(stderr);
+    // handle multiple requests on same connection
+    conn_write_session_t ws; memset(&ws, 0, sizeof(ws));
+    for (;;) {
+        char *buf = NULL; uint32_t len = 0;
+        if (recv_msg(cfd, &buf, &len) != 0) { fprintf(stderr, "[SS] recv_msg error or EOF\n"); free(buf); break; }
+        if (!buf || len == 0) { fprintf(stderr, "[SS] empty msg\n"); free(buf); break; }
+        fprintf(stderr, "[SS] recv %u bytes: %.*s\n", len, (int)len, buf); fflush(stderr);
+        char type[32];
+        if (json_get_string_field(buf, "type", type, sizeof(type)) == 0) {
+            fprintf(stderr, "[SS] type=%s\n", type); fflush(stderr);
+            if (strcmp(type, "READ") == 0) {
+                char file[128];
+                char ticket[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                if (!okf || !okt) {
+                    const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                } else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) {
+                    const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                } else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    char *content = NULL; size_t clen = 0;
+                    if (read_file_into(path, &content, &clen) == 0) {
+                        char resp[8192]; resp[0] = '\0';
+                        strncat(resp, "{\"status\":\"OK\",\"body\":\"", sizeof(resp) - strlen(resp) - 1);
+                        json_escape_append(resp, sizeof(resp), content);
+                        strncat(resp, "\"}", sizeof(resp) - strlen(resp) - 1);
+                        send_msg(cfd, resp, (uint32_t)strlen(resp));
+                        free(content);
+                    } else {
+                        const char *resp = "{\"status\":\"ERR_NOTFOUND\"}";
+                        send_msg(cfd, resp, (uint32_t)strlen(resp));
+                    }
+                }
+            } else if (strcmp(type, "CREATE") == 0) {
+                char file[128];
+                if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    ensure_parent_dirs_for(path);
+                    fprintf(stderr, "[SS] CREATE file=%s path=%s\n", file, path); fflush(stderr);
+                    FILE *test = fopen(path, "rb");
+                    if (test) { fclose(test); const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        FILE *f = fopen(path, "wb");
+                        if (!f) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        else { fclose(f); const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    }
+                } else { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+            } else if (strcmp(type, "DELETE") == 0) {
+                char file[128];
+                if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    fprintf(stderr, "[SS] DELETE file=%s path=%s\n", file, path); fflush(stderr);
+                    int ok = (unlink(path) == 0);
+                    // Best-effort: remove undo snapshot
+                    char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, file);
+                    (void)unlink(undopath);
+                    // Remove checkpoints folder for file
+                    char chkdir[SS_PATH_MAX]; snprintf(chkdir, sizeof(chkdir), "%s/checkpoints/%s", g_store_root, file);
+                    DIR *cd = opendir(chkdir);
+                    if (cd) {
+                        struct dirent *de; char entry[SS_PATH_MAX];
+                        while ((de = readdir(cd)) != NULL) {
+                            if (strcmp(de->d_name, ".")==0 || strcmp(de->d_name, "..")==0) continue;
+                            snprintf(entry, sizeof(entry), "%s/checkpoints/%s/%s", g_store_root, file, de->d_name);
+                            (void)unlink(entry);
+                        }
+                        closedir(cd);
+                        (void)rmdir(chkdir);
+                    }
+                    // Remove history snapshots for file
+                    char hdir[SS_PATH_MAX]; snprintf(hdir, sizeof(hdir), "%s/history", g_store_root);
+                    DIR *hd = opendir(hdir);
+                    if (hd) {
+                        size_t flen = strlen(file); struct dirent *de;
+                        while ((de = readdir(hd)) != NULL) {
+                            const char *name = de->d_name;
+                            if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
+                                char hp[SS_PATH_MAX]; snprintf(hp, sizeof(hp), "%s/history/%s", g_store_root, name);
+                                (void)unlink(hp);
+                            }
+                        }
+                        closedir(hd);
+                    }
+                    if (ok) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                } else { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+            } else if (strcmp(type, "CREATEFOLDER") == 0) {
+                // Create a folder inside files/ for this SS
+                char pathrel[256];
+                if (json_get_string_field(buf, "path", pathrel, sizeof(pathrel)) != 0 || !pathrel[0]) {
+                    const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                } else {
+                    char dirpath[SS_PATH_MAX];
+                    snprintf(dirpath, sizeof(dirpath), "%s/files/%s", g_store_root, pathrel);
+                    // Create parent dirs, then the final folder
+                    ensure_parent_dirs_for(dirpath);
+                    int rc = mkdir(dirpath, 0755);
+                    if (rc != 0 && errno != EEXIST) { perror("[SS] mkdir CREATEFOLDER"); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                    else { const char *ok = "{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
+                }
+            } else if (strcmp(type, "BEGIN_WRITE") == 0) {
+                char file[128]; int sidx = 0; // default to 0 if absent
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                char ticket[256]; int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                int idxrc = json_get_int_field(buf, "sentenceIndex", &sidx);
+                fprintf(stderr, "[SS] BEGIN_WRITE file=%s okf=%d idxrc=%d sidx=%d\n", okf?file:"?", okf, idxrc, sidx); fflush(stderr);
+                if (!okf) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (!(okt && ticket_validate(ticket, file, "WRITE", g_ss_id) == 0)) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"session-active\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    int lrc = lock_acquire(file, sidx);
+                    fprintf(stderr, "[SS] lock_acquire rc=%d\n", lrc); fflush(stderr);
+                    if (lrc != 0) { const char *resp = "{\"status\":\"ERR_LOCKED\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        // Mark session active and send OK immediately so client can show prompt without waiting
+                        ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.pre_image=NULL; ws.pre_image_len=0; memset(&ws.doc, 0, sizeof(ws.doc));
+                        const char *ok_immediate = "{\"status\":\"OK\"}"; send_msg(cfd, ok_immediate, (uint32_t)strlen(ok_immediate));
+
+                        // Now, prepare the in-memory doc/token state. Any error will be surfaced on next APPLY/END_WRITE.
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                        char *content = NULL; size_t clen = 0;
+                        int rfirc = read_file_into(path, &content, &clen);
+                        fprintf(stderr, "[SS] (post-OK) read_file_into rc=%d path=%s\n", rfirc, path); fflush(stderr);
+                        if (rfirc != 0) {
+                            // Create missing file and start with an empty document (one empty sentence)
+                            ensure_parent_dirs_for(path);
+                            FILE *nf = fopen(path, "wb"); if (nf) { fclose(nf); fprintf(stderr, "[SS] created missing file %s\n", path); } else { fprintf(stderr, "[SS] failed to create %s\n", path); }
+                            ss_doc_tokens_t doc; memset(&doc, 0, sizeof(doc));
+                            doc.num_sentences = 1; doc.sent_words = (char ***)calloc(1, sizeof(char **)); doc.word_counts = (int *)calloc(1, sizeof(int));
+                            if (!doc.sent_words || !doc.word_counts || sidx < 0 || sidx >= doc.num_sentences) {
+                                if (doc.sent_words) free(doc.sent_words);
+                                if (doc.word_counts) free(doc.word_counts);
+                                // Fail session lazily; release lock and mark inactive
+                                lock_release(file, sidx);
+                                ws.active = 0;
+                                fprintf(stderr, "[SS] BEGIN_WRITE setup failed for empty doc; session aborted\n");
+                            } else {
+                                ws.doc = doc; // pre_image stays NULL for empty file
+                                fprintf(stderr, "[SS] BEGIN_WRITE session ready (empty doc), sidx=%d\n", sidx); fflush(stderr);
+                            }
+                        } else {
+                            // capture pre-image for UNDO from current content
+                            char *pre = NULL; size_t prelen = clen; if (clen > 0) { pre = (char *)malloc(clen); if (pre) memcpy(pre, content, clen); }
+                            ss_doc_tokens_t doc; if (ss_tokenize(content, &doc) != 0) {
+                                fprintf(stderr, "[SS] tokenize failed (post-OK)\n"); if(pre) free(pre); lock_release(file, sidx); ws.active=0;
+                            } else {
+                                fprintf(stderr, "[SS] tokenized num_sentences=%d\n", doc.num_sentences); fflush(stderr);
+                                if (doc.num_sentences == 0 && sidx == 0) {
+                                    doc.num_sentences = 1;
+                                    doc.sent_words = (char ***)calloc(1, sizeof(char **));
+                                    doc.word_counts = (int *)calloc(1, sizeof(int));
+                                    if (!doc.sent_words || !doc.word_counts) { ss_tokens_free(&doc); if(pre) free(pre); lock_release(file, sidx); ws.active=0; }
+                                }
+                                if (ws.active) {
+                                    if (sidx < 0 || sidx > doc.num_sentences) {
+                                        fprintf(stderr, "[SS] sidx out of range (post-OK): sidx=%d num_sentences=%d\n", sidx, doc.num_sentences);
+                                        ss_tokens_free(&doc); if(pre) free(pre); lock_release(file, sidx); ws.active=0;
+                                    } else if (sidx == doc.num_sentences) {
+                                        // append new empty sentence
+                                        int ns = doc.num_sentences + 1;
+                                        char ***sw = (char ***)realloc(doc.sent_words, (size_t)ns * sizeof(char **));
+                                        int *wcarr = (int *)realloc(doc.word_counts, (size_t)ns * sizeof(int));
+                                        if (!sw || !wcarr) { ss_tokens_free(&doc); if(pre) free(pre); lock_release(file, sidx); ws.active=0; }
+                                        else {
+                                            doc.sent_words = sw; doc.word_counts = wcarr; doc.num_sentences = ns; doc.sent_words[ns-1] = NULL; doc.word_counts[ns-1] = 0;
+                                            ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
+                                            fprintf(stderr, "[SS] BEGIN_WRITE session ready (append new sentence), sidx=%d\n", sidx); fflush(stderr);
+                                        }
+                                    } else {
+                                        ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
+                                        fprintf(stderr, "[SS] BEGIN_WRITE session ready, sidx=%d\n", sidx); fflush(stderr);
+                                    }
+                                }
+                            }
+                        }
+                        if (content) free(content);
+                    }
+                }
+            } else if (strcmp(type, "APPLY") == 0) {
+                if (!ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    int widx = -1; char content[512]; content[0] = '\0';
+                    int okw = (json_get_int_field(buf, "wordIndex", &widx) == 0);
+                    int okc = (json_get_string_field(buf, "content", content, sizeof(content)) == 0);
+                    fprintf(stderr, "[SS] APPLY okw=%d okc=%d widx=%d content=%s\n", okw, okc, widx, okc?content:"?"); fflush(stderr);
+                    if (!okw || !okc) { const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"missing-fields\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        if (ss_tokens_replace_or_append(&ws.doc, ws.sentence_idx, widx, content) != 0) {
+                            fprintf(stderr, "[SS] APPLY failed (indices)\n"); fflush(stderr);
+                            const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"invalid-index-or-content\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                        } else {
+                            fprintf(stderr, "[SS] APPLY OK\n"); fflush(stderr);
+                            const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                        }
+                    }
+                }
+            } else if (strcmp(type, "END_WRITE") == 0) {
+                if (!ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char *new_text = ss_tokens_compose(&ws.doc);
+                    fprintf(stderr, "[SS] END_WRITE composing: %s\n", new_text?new_text:"(null)"); fflush(stderr);
+                    if (!new_text) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, ws.file);
+                        // Before committing, save a one-level undo snapshot of the pre-commit content captured at BEGIN_WRITE
+                        char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, ws.file);
+                        char tmppath[SS_PATH_MAX];
+                        size_t pl = strlen(path);
+                        if (pl + 4 + 1 <= sizeof(tmppath)) {
+                            snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
+                        } else {
+                            char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root);
+                            mkdir(mp, 0755);
+                            snprintf(tmppath, sizeof(tmppath), "%s", mp);
+                            strncat(tmppath, "/commit.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
+                        }
+                        fprintf(stderr, "[SS] END_WRITE write temp=%s final=%s\n", tmppath, path); fflush(stderr);
+                        FILE *f = fopen(tmppath, "wb");
+                        if (!f) { free(new_text); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        else {
+                            size_t n = fwrite(new_text, 1, strlen(new_text), f);
+                            (void)n; fflush(f);
+                            fclose(f);
+                            // Snapshot for UNDO and HISTORY from session pre_image (best-effort)
+                            ensure_parent_dirs_for(undopath);
+                            FILE *uf = fopen(undopath, "wb");
+                            if (uf) { if (ws.pre_image && ws.pre_image_len > 0) fwrite(ws.pre_image, 1, ws.pre_image_len, uf); fflush(uf); fclose(uf); fprintf(stderr, "[SS] undo snapshot saved from session: %s (len=%zu)\n", undopath, ws.pre_image_len);} else { perror("[SS] undo fopen"); }
+                            history_save_snapshot(ws.file, ws.pre_image, ws.pre_image_len);
+                            if (rename(tmppath, path) != 0) {
+                                perror("[SS] rename");
+                                unlink(tmppath); free(new_text); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                            } else {
+                                fprintf(stderr, "[SS] END_WRITE commit OK\n"); fflush(stderr);
+                                free(new_text);
+                                const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                                // Notify NM about commit for replication
+                                int nfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
+                                if (nfd >= 0) {
+                                    char note[256]; note[0]='\0'; json_put_string_field(note, sizeof(note), "type", "SS_COMMIT", 1); json_put_string_field(note, sizeof(note), "file", ws.file, 0); json_put_int_field(note, sizeof(note), "ssId", g_ss_id, 0); strncat(note, "}", sizeof(note)-strlen(note)-1);
+                                    (void)send_msg(nfd, note, (uint32_t)strlen(note)); char *nr=NULL; uint32_t nrl=0; (void)recv_msg(nfd, &nr, &nrl); if (nr) free(nr); close(nfd);
+                                }
+                            }
+                        }
+                    }
+                    lock_release(ws.file, ws.sentence_idx);
+                    ss_tokens_free(&ws.doc);
+                    if (ws.pre_image) { free(ws.pre_image); ws.pre_image=NULL; ws.pre_image_len=0; }
+                    memset(&ws, 0, sizeof(ws));
+                }
+            } else if (strcmp(type, "UNDO") == 0) {
+                char file[128]; char ticket[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                if (!okf || !okt) {
+                    const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                } else if (ticket_validate(ticket, file, "UNDO", g_ss_id) != 0) {
+                    const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                } else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, file);
+                    // Load undo snapshot
+                    char *undo_content = NULL; size_t ulen = 0;
+                    if (read_file_into(undopath, &undo_content, &ulen) != 0) {
+                        const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                    } else {
+                        // Write undo content to a temp and atomically replace
+                        char tmppath[SS_PATH_MAX];
+                        size_t pl = strlen(path);
+                        if (pl + 6 + 1 <= sizeof(tmppath)) {
+                            snprintf(tmppath, sizeof(tmppath), "%s.udtmp", path);
+                        } else {
+                            char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root);
+                            mkdir(mp, 0755);
+                            snprintf(tmppath, sizeof(tmppath), "%s", mp);
+                            strncat(tmppath, "/undo.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
+                        }
+                    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
+                    char path2[SS_PATH_MAX]; snprintf(path2, sizeof(path2), "%s/files/%s", g_store_root, file);
+                        FILE *f = fopen(tmppath, "wb");
+                        if (!f) { free(undo_content); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        else {
+                            size_t n = fwrite(undo_content, 1, ulen, f); (void)n; fflush(f); fclose(f);
+                            free(undo_content);
+                            if (rename(tmppath, path2) != 0) {
+                                perror("[SS] undo rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                            } else {
+                                // Consume the undo snapshot after successful restore
+                                unlink(undopath);
+                                const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                            }
+                        }
+                    }
+                }
+            } else if (strcmp(type, "HISTORY") == 0) {
+                char file[128]; char ticket[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "HISTORY", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    // Build versions list
+                    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
+                    DIR *d = opendir(dpath);
+                    char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"versions\":[");
+                    if (d) {
+                        size_t flen = strlen(file); int first=1; struct dirent *de;
+                        while ((de = readdir(d)) != NULL) {
+                            const char *name = de->d_name;
+                            if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
+                                const char *rest = name + flen + 1; char *ep=NULL; long val=strtol(rest,&ep,10);
+                                if (ep && strcmp(ep, ".snap")==0 && val>0) {
+                                    if (!first) w += snprintf(resp+w, sizeof(resp)-w, ",");
+                                    first=0; w += snprintf(resp+w, sizeof(resp)-w, "%ld", val);
+                                }
+                            }
+                        }
+                        closedir(d);
+                    }
+                    if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
+                    send_msg(cfd, resp, (uint32_t)strlen(resp));
+                }
+            } else if (strcmp(type, "REVERT") == 0) {
+                char file[128]; char ticket[256]; int ver=0; char cname[256]; cname[0]='\0';
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                (void)json_get_int_field(buf, "version", &ver);
+                (void)json_get_string_field(buf, "name", cname, sizeof(cname));
+                if (!okf || !okt || ((ver<=0) && !cname[0])) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "REVERT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    // Save pre-revert into history
+                    char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen)==0) { history_save_snapshot(file, cur, clen); free(cur);} 
+                    // Load snapshot to revert to (by version or checkpoint name)
+                    char hpath[SS_PATH_MAX];
+                    if (cname[0]) snprintf(hpath, sizeof(hpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, cname);
+                    else snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, ver);
+                    char *snap=NULL; size_t slen=0;
+                    if (read_file_into(hpath, &snap, &slen) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
+                        if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.rvtmp", path); else { char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755); snprintf(tmppath, sizeof(tmppath), "%s", mp); strncat(tmppath, "/revert.tmp", sizeof(tmppath)-strlen(tmppath)-1);} 
+                        FILE *f = fopen(tmppath, "wb"); if (!f) { free(snap); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        else { fwrite(snap, 1, slen, f); fflush(f); fclose(f); free(snap); if (rename(tmppath, path)!=0) { perror("[SS] revert rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } }
+                    }
+                }
+            } else if (strcmp(type, "CHECKPOINT") == 0) {
+                char file[128]; char ticket[256]; char name[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                int okn = (json_get_string_field(buf, "name", name, sizeof(name)) == 0);
+                if (!okf || !okt || !okn || !name[0]) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "CHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                    else {
+                        char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
+                        ensure_parent_dirs_for(cpath);
+                        FILE *f = fopen(cpath, "wb"); if (!f) { free(cur); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                        else { fwrite(cur, 1, clen, f); fflush(f); fclose(f); free(cur); const char *ok="{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
+                    }
+                }
+            } else if (strcmp(type, "LISTCHECKPOINTS") == 0) {
+                char file[128]; char ticket[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "LISTCHECKPOINTS", g_ss_id) != 0 && ticket_validate(ticket, file, "VIEWCHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/checkpoints/%s", g_store_root, file);
+                    DIR *d = opendir(dpath);
+                    char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"checkpoints\":[");
+                    int first=1; if (d) {
+                        struct dirent *de; while ((de=readdir(d))!=NULL) {
+                            const char *n = de->d_name;
+                            size_t ln = strlen(n);
+                            if (ln > 4 && strcmp(n + ln - 4, ".chk") == 0) {
+                                char name[256]; size_t sl = ln - 4; if (sl >= sizeof(name)) sl = sizeof(name)-1; memcpy(name, n, sl); name[sl]='\0';
+                                if (!first) w += snprintf(resp+w, sizeof(resp)-w, ",");
+                                first=0;
+                                w += snprintf(resp+w, sizeof(resp)-w, "\"%s\"", name);
+                            }
+                        }
+                        closedir(d);
+                    }
+                    if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
+                    send_msg(cfd, resp, (uint32_t)strlen(resp));
+                }
+            } else if (strcmp(type, "VIEWCHECKPOINT") == 0) {
+                char file[128]; char ticket[256]; char name[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                int okn = (json_get_string_field(buf, "name", name, sizeof(name)) == 0);
+                if (!okf || !okt || !okn) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "VIEWCHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
+                    char *content=NULL; size_t clen=0; if (read_file_into(cpath, &content, &clen) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                    else {
+                        char resp[8192]; resp[0]='\0';
+                        strncat(resp, "{\"status\":\"OK\",\"body\":\"", sizeof(resp)-strlen(resp)-1);
+                        json_escape_append(resp, sizeof(resp), content);
+                        strncat(resp, "\"}", sizeof(resp)-strlen(resp)-1);
+                        free(content);
+                        send_msg(cfd, resp, (uint32_t)strlen(resp));
+                    }
+                }
+            } else if (strcmp(type, "RENAME") == 0) {
+                char file[128], nfile[128];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okn = (json_get_string_field(buf, "newFile", nfile, sizeof(nfile)) == 0);
+                if (!okf || !okn) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char path_old[SS_PATH_MAX]; snprintf(path_old, sizeof(path_old), "%s/files/%s", g_store_root, file);
+                    char path_new[SS_PATH_MAX]; snprintf(path_new, sizeof(path_new), "%s/files/%s", g_store_root, nfile);
+                    // Conflicts
+                    struct stat st;
+                    if (stat(path_old, &st) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else if (stat(path_new, &st) == 0) { const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        // Rename undo snapshot if present
+                        char u_old[SS_PATH_MAX]; snprintf(u_old, sizeof(u_old), "%s/undo/%s.undo", g_store_root, file);
+                        char u_new[SS_PATH_MAX]; snprintf(u_new, sizeof(u_new), "%s/undo/%s.undo", g_store_root, nfile);
+                        ensure_parent_dirs_for(u_new);
+                        if (stat(u_old, &st) == 0) { (void)rename(u_old, u_new); }
+                        // Rename checkpoints directory if present
+                        char c_old[SS_PATH_MAX]; snprintf(c_old, sizeof(c_old), "%s/checkpoints/%s", g_store_root, file);
+                        char c_new[SS_PATH_MAX]; snprintf(c_new, sizeof(c_new), "%s/checkpoints/%s", g_store_root, nfile);
+                        if (stat(c_old, &st) == 0) {
+                            ensure_parent_dirs_for(c_new);
+                            // Attempt directory rename (will move the folder atomically within same filesystem)
+                            (void)rename(c_old, c_new);
+                        }
+                        // Rename history snapshots
+                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
+                        DIR *d = opendir(dpath);
+                        if (d) {
+                            size_t flen = strlen(file); struct dirent *de;
+                            while ((de = readdir(d)) != NULL) {
+                                const char *name = de->d_name;
+                                if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
+                                    char src[SS_PATH_MAX]; char dst[SS_PATH_MAX];
+                                    snprintf(src, sizeof(src), "%s/history/%s", g_store_root, name);
+                                    snprintf(dst, sizeof(dst), "%s/history/%s%s", g_store_root, nfile, name + flen);
+                                    ensure_parent_dirs_for(dst);
+                                    (void)rename(src, dst);
+                                }
+                            }
+                            closedir(d);
+                        }
+                        // Finally rename main file
+                        ensure_parent_dirs_for(path_new);
+                        if (rename(path_old, path_new) != 0) { perror("[SS] rename main"); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                        else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    }
+                }
+            } else if (strcmp(type, "PUT") == 0) {
+                // Atomically replace file contents with provided body (raw text)
+                char file[128]; char body[8192]; body[0]='\0';
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okb = (json_get_string_field(buf, "body", body, sizeof(body)) == 0);
+                if (!okf || !okb) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    // Write to temp then rename
+                    char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
+                    if (pl + 5 + 1 <= sizeof(tmppath)) {
+                        snprintf(tmppath, sizeof(tmppath), "%s.ptmp", path);
+                    } else {
+                        char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755);
+                        snprintf(tmppath, sizeof(tmppath), "%s", mp);
+                        strncat(tmppath, "/put.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
+                    }
+                    fprintf(stderr, "[SS] PUT writing tmppath=%s final=%s len=%zu\n", tmppath, path, strlen(body)); fflush(stderr);
+                    ensure_parent_dirs_for(path);
+                    FILE *f = fopen(tmppath, "wb");
+                    if (!f) { perror("[SS] put fopen"); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        fwrite(body, 1, strlen(body), f); fflush(f); fclose(f);
+                        if (rename(tmppath, path) != 0) {
+                            perror("[SS] put rename");
+                            unlink(tmppath);
+                            const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                        } else {
+                            char cwd[512]; if (getcwd(cwd, sizeof(cwd))) fprintf(stderr, "[SS] PUT commit OK at %s -> %s\n", cwd, path);
+                            else fprintf(stderr, "[SS] PUT commit OK -> %s\n", path);
+                            const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                        }
+                    }
+                }
+            } else if (strcmp(type, "INFO") == 0) {
+                // Return file metadata: size (bytes), mtime, word count, char count
+                char file[128]; char ticket[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0 && ticket_validate(ticket, file, "WRITE", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    struct stat st;
+                    if (stat(path, &st) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        // Read content to count words (best-effort)
+                        char *content=NULL; size_t clen=0; int words=0;
+                        if (read_file_into(path, &content, &clen) == 0 && content) {
+                            // Count words by splitting on spaces/newlines
+                            int in_word = 0; for (size_t i=0;i<clen;i++){ unsigned char c=(unsigned char)content[i]; if (c==' '||c=='\n' || c=='\t' || c=='\r'){ if (in_word){ words++; in_word=0; } } else { in_word=1; } }
+                            if (in_word) words++;
+                            free(content);
+                        }
+                        char resp[512];
+                        snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"size\":%lld,\"mtime\":%lld,\"atime\":%lld,\"words\":%d,\"chars\":%lld}",
+                                 (long long)st.st_size, (long long)st.st_mtime, (long long)st.st_atime, words, (long long)st.st_size);
+                        send_msg(cfd, resp, (uint32_t)strlen(resp));
+                    }
+                }
+            } else if (strcmp(type, "STREAM") == 0) {
+                // Stream content word-by-word with 0.1s delay; client reads until STOP
+                char file[128]; char ticket[256];
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
+                if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
+                    char *content=NULL; size_t clen=0;
+                    if (read_file_into(path, &content, &clen) != 0 || !content) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                    else {
+                        // Simple split by whitespace into words
+                        size_t i=0;
+                        while (i < clen) {
+                            while (i < clen && (content[i]==' ' || content[i]=='\n' || content[i]=='\t' || content[i]=='\r')) i++;
+                            size_t start=i;
+                            while (i < clen && !(content[i]==' ' || content[i]=='\n' || content[i]=='\t' || content[i]=='\r')) i++;
+                            if (i>start) {
+                                size_t wlen = i-start; if (wlen > 256) wlen = 256;
+                                char word[260]; memcpy(word, content+start, wlen); word[wlen]='\0';
+                                char frame[320]; snprintf(frame, sizeof(frame), "{\"status\":\"OK\",\"word\":\"%s\"}", word);
+                                if (send_msg(cfd, frame, (uint32_t)strlen(frame)) != 0) break;
+                                {
+                                    struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000; // 0.1s
+                                    select(0, NULL, NULL, NULL, &tv);
+                                }
+                            }
+                        }
+                        free(content);
+                        const char *stop = "{\"status\":\"STOP\"}"; send_msg(cfd, stop, (uint32_t)strlen(stop));
+                    }
+                }
+            } else {
+                const char *resp = "{\"status\":\"ERR_BADREQ\"}";
+                send_msg(cfd, resp, (uint32_t)strlen(resp));
+            }
+        } else {
+            const char *resp = "{\"status\":\"ERR_BADREQ\"}";
+            send_msg(cfd, resp, (uint32_t)strlen(resp));
+        }
+        free(buf);
+    }
+    if (ws.active) { lock_release(ws.file, ws.sentence_idx); ss_tokens_free(&ws.doc); if (ws.pre_image) free(ws.pre_image); }
+    close(cfd);
+    return NULL;
+}
+
 static void *data_server_thread(void *arg) {
     data_server_args_t *cfg = (data_server_args_t *)arg;
     int lfd = cfg->listen_fd;
@@ -200,569 +773,16 @@ static void *data_server_thread(void *arg) {
     while (g_run) {
         int cfd = accept(lfd, NULL, NULL);
         if (cfd < 0) { if (errno==EINTR) continue; perror("accept"); break; }
-        fprintf(stderr, "[SS] accept cfd=%d\n", cfd); fflush(stderr);
-        // handle multiple requests on same connection
-        conn_write_session_t ws; memset(&ws, 0, sizeof(ws));
-        for (;;) {
-            char *buf = NULL; uint32_t len = 0;
-            if (recv_msg(cfd, &buf, &len) != 0) { fprintf(stderr, "[SS] recv_msg error or EOF\n"); free(buf); break; }
-            if (!buf || len == 0) { fprintf(stderr, "[SS] empty msg\n"); free(buf); break; }
-            fprintf(stderr, "[SS] recv %u bytes: %.*s\n", len, (int)len, buf); fflush(stderr);
-            char type[32];
-            if (json_get_string_field(buf, "type", type, sizeof(type)) == 0) {
-                fprintf(stderr, "[SS] type=%s\n", type); fflush(stderr);
-                if (strcmp(type, "READ") == 0) {
-                    char file[128];
-                    char ticket[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    if (!okf || !okt) {
-                        const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    } else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) {
-                        const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    } else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        char *content = NULL; size_t clen = 0;
-                        if (read_file_into(path, &content, &clen) == 0) {
-                            char resp[8192]; resp[0] = '\0';
-                            strncat(resp, "{\"status\":\"OK\",\"body\":\"", sizeof(resp) - strlen(resp) - 1);
-                            json_escape_append(resp, sizeof(resp), content);
-                            strncat(resp, "\"}", sizeof(resp) - strlen(resp) - 1);
-                            send_msg(cfd, resp, (uint32_t)strlen(resp));
-                            free(content);
-                        } else {
-                            const char *resp = "{\"status\":\"ERR_NOTFOUND\"}";
-                            send_msg(cfd, resp, (uint32_t)strlen(resp));
-                        }
-                    }
-                } else if (strcmp(type, "CREATE") == 0) {
-                    char file[128];
-                    if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        ensure_parent_dirs_for(path);
-                        fprintf(stderr, "[SS] CREATE file=%s path=%s\n", file, path); fflush(stderr);
-                        FILE *test = fopen(path, "rb");
-                        if (test) { fclose(test); const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            FILE *f = fopen(path, "wb");
-                            if (!f) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                            else { fclose(f); const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        }
-                    } else { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                } else if (strcmp(type, "DELETE") == 0) {
-                    char file[128];
-                    if (json_get_string_field(buf, "file", file, sizeof(file)) == 0) {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        fprintf(stderr, "[SS] DELETE file=%s path=%s\n", file, path); fflush(stderr);
-                        int ok = (unlink(path) == 0);
-                        // Best-effort: remove undo snapshot
-                        char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, file);
-                        (void)unlink(undopath);
-                        // Remove checkpoints folder for file
-                        char chkdir[SS_PATH_MAX]; snprintf(chkdir, sizeof(chkdir), "%s/checkpoints/%s", g_store_root, file);
-                        DIR *cd = opendir(chkdir);
-                        if (cd) {
-                            struct dirent *de; char entry[SS_PATH_MAX];
-                            while ((de = readdir(cd)) != NULL) {
-                                if (strcmp(de->d_name, ".")==0 || strcmp(de->d_name, "..")==0) continue;
-                                snprintf(entry, sizeof(entry), "%s/checkpoints/%s/%s", g_store_root, file, de->d_name);
-                                (void)unlink(entry);
-                            }
-                            closedir(cd);
-                            (void)rmdir(chkdir);
-                        }
-                        // Remove history snapshots for file
-                        char hdir[SS_PATH_MAX]; snprintf(hdir, sizeof(hdir), "%s/history", g_store_root);
-                        DIR *hd = opendir(hdir);
-                        if (hd) {
-                            size_t flen = strlen(file); struct dirent *de;
-                            while ((de = readdir(hd)) != NULL) {
-                                const char *name = de->d_name;
-                                if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                    char hp[SS_PATH_MAX]; snprintf(hp, sizeof(hp), "%s/history/%s", g_store_root, name);
-                                    (void)unlink(hp);
-                                }
-                            }
-                            closedir(hd);
-                        }
-                        if (ok) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    } else { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                } else if (strcmp(type, "CREATEFOLDER") == 0) {
-                    // Create a folder inside files/ for this SS
-                    char pathrel[256];
-                    if (json_get_string_field(buf, "path", pathrel, sizeof(pathrel)) != 0 || !pathrel[0]) {
-                        const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    } else {
-                        char dirpath[SS_PATH_MAX];
-                        snprintf(dirpath, sizeof(dirpath), "%s/files/%s", g_store_root, pathrel);
-                        // Create parent dirs, then the final folder
-                        ensure_parent_dirs_for(dirpath);
-                        int rc = mkdir(dirpath, 0755);
-                        if (rc != 0 && errno != EEXIST) { perror("[SS] mkdir CREATEFOLDER"); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
-                        else { const char *ok = "{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
-                    }
-                } else if (strcmp(type, "BEGIN_WRITE") == 0) {
-                    char file[128]; int sidx = 0; // default to 0 if absent
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    char ticket[256]; int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    int idxrc = json_get_int_field(buf, "sentenceIndex", &sidx);
-                    fprintf(stderr, "[SS] BEGIN_WRITE file=%s okf=%d idxrc=%d sidx=%d\n", okf?file:"?", okf, idxrc, sidx); fflush(stderr);
-                    if (!okf) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (!(okt && ticket_validate(ticket, file, "WRITE", g_ss_id) == 0)) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"session-active\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        int lrc = lock_acquire(file, sidx);
-                        fprintf(stderr, "[SS] lock_acquire rc=%d\n", lrc); fflush(stderr);
-                        if (lrc != 0) { const char *resp = "{\"status\":\"ERR_LOCKED\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                            char *content = NULL; size_t clen = 0;
-                            int rfirc = read_file_into(path, &content, &clen);
-                            fprintf(stderr, "[SS] read_file_into rc=%d path=%s\n", rfirc, path); fflush(stderr);
-                            if (rfirc != 0) {
-                                // Lazily create missing file and allow starting a write session
-                                ensure_parent_dirs_for(path);
-                                FILE *nf = fopen(path, "wb"); if (nf) { fclose(nf); fprintf(stderr, "[SS] created missing file %s\n", path); } else { fprintf(stderr, "[SS] failed to create %s\n", path); }
-                                ss_doc_tokens_t doc; memset(&doc, 0, sizeof(doc));
-                                // initialize one empty sentence to allow appends at sidx==0
-                                doc.num_sentences = 1;
-                                doc.sent_words = (char ***)calloc(1, sizeof(char **));
-                                doc.word_counts = (int *)calloc(1, sizeof(int));
-                                if (!doc.sent_words || !doc.word_counts || sidx < 0 || sidx >= doc.num_sentences) {
-                                    if (doc.sent_words) free(doc.sent_words);
-                                    if (doc.word_counts) free(doc.word_counts);
-                                    lock_release(file, sidx);
-                                    const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                } else {
-                                    ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image=NULL; ws.pre_image_len=0;
-                                    fprintf(stderr, "[SS] BEGIN_WRITE session started (empty doc), sidx=%d\n", sidx); fflush(stderr);
-                                    const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                }
-                            }
-                            else {
-                                // capture pre-image for UNDO from current content
-                                char *pre = NULL; size_t prelen = clen; if (clen > 0) { pre = (char *)malloc(clen); if (pre) memcpy(pre, content, clen); }
-                                ss_doc_tokens_t doc; if (ss_tokenize(content, &doc) != 0) { fprintf(stderr, "[SS] tokenize failed\n"); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                                else {
-                                    fprintf(stderr, "[SS] tokenized num_sentences=%d\n", doc.num_sentences); fflush(stderr);
-                                    if (doc.num_sentences == 0 && sidx == 0) {
-                                        doc.num_sentences = 1;
-                                        doc.sent_words = (char ***)calloc(1, sizeof(char **));
-                                        doc.word_counts = (int *)calloc(1, sizeof(int));
-                                        if (!doc.sent_words || !doc.word_counts) { ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                                    }
-                                    if (sidx < 0 || sidx > doc.num_sentences) { fprintf(stderr, "[SS] sidx out of range: sidx=%d num_sentences=%d\n", sidx, doc.num_sentences); ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                                    else if (sidx == doc.num_sentences) {
-                                        // Allow appending a new empty sentence and start a write session on it
-                                        int ns = doc.num_sentences + 1;
-                                        char ***sw = (char ***)realloc(doc.sent_words, (size_t)ns * sizeof(char **));
-                                        int *wcarr = (int *)realloc(doc.word_counts, (size_t)ns * sizeof(int));
-                                        if (!sw || !wcarr) { ss_tokens_free(&doc); if(pre) free(pre); free(content); lock_release(file, sidx); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                                        else {
-                                            doc.sent_words = sw; doc.word_counts = wcarr; doc.num_sentences = ns;
-                                            doc.sent_words[ns-1] = NULL; doc.word_counts[ns-1] = 0;
-                                            // Start session now that the sentence exists
-                                            ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
-                                            fprintf(stderr, "[SS] BEGIN_WRITE session started (append new sentence), sidx=%d\n", sidx); fflush(stderr);
-                                            const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                            // Do not free pre/content here; handled after outer scope
-                                        }
-                                    }
-                                    else {
-                                        ws.active = 1; snprintf(ws.file, sizeof(ws.file), "%s", file); ws.sentence_idx = sidx; ws.doc = doc; ws.pre_image = pre; ws.pre_image_len = pre ? prelen : 0;
-                                        fprintf(stderr, "[SS] BEGIN_WRITE session started, sidx=%d\n", sidx); fflush(stderr);
-                                        const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                    }
-                                }
-                                free(content);
-                            }
-                        }
-                    }
-                } else if (strcmp(type, "APPLY") == 0) {
-                    if (!ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        int widx = -1; char content[512]; content[0] = '\0';
-                        int okw = (json_get_int_field(buf, "wordIndex", &widx) == 0);
-                        int okc = (json_get_string_field(buf, "content", content, sizeof(content)) == 0);
-                        fprintf(stderr, "[SS] APPLY okw=%d okc=%d widx=%d content=%s\n", okw, okc, widx, okc?content:"?"); fflush(stderr);
-                        if (!okw || !okc) { const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"missing-fields\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            if (ss_tokens_replace_or_append(&ws.doc, ws.sentence_idx, widx, content) != 0) {
-                                fprintf(stderr, "[SS] APPLY failed (indices)\n"); fflush(stderr);
-                                const char *resp = "{\"status\":\"ERR_BADREQ\",\"msg\":\"invalid-index-or-content\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                            } else {
-                                fprintf(stderr, "[SS] APPLY OK\n"); fflush(stderr);
-                                const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                            }
-                        }
-                    }
-                } else if (strcmp(type, "END_WRITE") == 0) {
-                    if (!ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char *new_text = ss_tokens_compose(&ws.doc);
-                        fprintf(stderr, "[SS] END_WRITE composing: %s\n", new_text?new_text:"(null)"); fflush(stderr);
-                        if (!new_text) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, ws.file);
-                            // Before committing, save a one-level undo snapshot of the pre-commit content captured at BEGIN_WRITE
-                            char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, ws.file);
-                            char tmppath[SS_PATH_MAX];
-                            size_t pl = strlen(path);
-                            if (pl + 4 + 1 <= sizeof(tmppath)) {
-                                snprintf(tmppath, sizeof(tmppath), "%s.tmp", path);
-                            } else {
-                                char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root);
-                                mkdir(mp, 0755);
-                                snprintf(tmppath, sizeof(tmppath), "%s", mp);
-                                strncat(tmppath, "/commit.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
-                            }
-                            fprintf(stderr, "[SS] END_WRITE write temp=%s final=%s\n", tmppath, path); fflush(stderr);
-                            FILE *f = fopen(tmppath, "wb");
-                            if (!f) { free(new_text); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                            else {
-                                size_t n = fwrite(new_text, 1, strlen(new_text), f);
-                                (void)n; fflush(f);
-                                fclose(f);
-                                // Snapshot for UNDO and HISTORY from session pre_image (best-effort)
-                                ensure_parent_dirs_for(undopath);
-                                FILE *uf = fopen(undopath, "wb");
-                                if (uf) { if (ws.pre_image && ws.pre_image_len > 0) fwrite(ws.pre_image, 1, ws.pre_image_len, uf); fflush(uf); fclose(uf); fprintf(stderr, "[SS] undo snapshot saved from session: %s (len=%zu)\n", undopath, ws.pre_image_len);} else { perror("[SS] undo fopen"); }
-                                history_save_snapshot(ws.file, ws.pre_image, ws.pre_image_len);
-                                if (rename(tmppath, path) != 0) {
-                                    perror("[SS] rename");
-                                    unlink(tmppath); free(new_text); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                } else {
-                                    fprintf(stderr, "[SS] END_WRITE commit OK\n"); fflush(stderr);
-                                    free(new_text);
-                                    const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                    // Notify NM about commit for replication
-                                    int nfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
-                                    if (nfd >= 0) {
-                                        char note[256]; note[0]='\0'; json_put_string_field(note, sizeof(note), "type", "SS_COMMIT", 1); json_put_string_field(note, sizeof(note), "file", ws.file, 0); json_put_int_field(note, sizeof(note), "ssId", g_ss_id, 0); strncat(note, "}", sizeof(note)-strlen(note)-1);
-                                        (void)send_msg(nfd, note, (uint32_t)strlen(note)); char *nr=NULL; uint32_t nrl=0; (void)recv_msg(nfd, &nr, &nrl); if (nr) free(nr); close(nfd);
-                                    }
-                                }
-                            }
-                        }
-                        lock_release(ws.file, ws.sentence_idx);
-                        ss_tokens_free(&ws.doc);
-                        if (ws.pre_image) { free(ws.pre_image); ws.pre_image=NULL; ws.pre_image_len=0; }
-                        memset(&ws, 0, sizeof(ws));
-                    }
-                } else if (strcmp(type, "UNDO") == 0) {
-                    char file[128]; char ticket[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    if (!okf || !okt) {
-                        const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    } else if (ticket_validate(ticket, file, "UNDO", g_ss_id) != 0) {
-                        const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    } else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        char undopath[SS_PATH_MAX]; snprintf(undopath, sizeof(undopath), "%s/undo/%s.undo", g_store_root, file);
-                        // Load undo snapshot
-                        char *undo_content = NULL; size_t ulen = 0;
-                        if (read_file_into(undopath, &undo_content, &ulen) != 0) {
-                            const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                        } else {
-                            // Write undo content to a temp and atomically replace
-                            char tmppath[SS_PATH_MAX];
-                            size_t pl = strlen(path);
-                            if (pl + 6 + 1 <= sizeof(tmppath)) {
-                                snprintf(tmppath, sizeof(tmppath), "%s.udtmp", path);
-                            } else {
-                                char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root);
-                                mkdir(mp, 0755);
-                                snprintf(tmppath, sizeof(tmppath), "%s", mp);
-                                strncat(tmppath, "/undo.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
-                            }
-                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                            FILE *f = fopen(tmppath, "wb");
-                            if (!f) { free(undo_content); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                            else {
-                                size_t n = fwrite(undo_content, 1, ulen, f); (void)n; fflush(f); fclose(f);
-                                free(undo_content);
-                                if (rename(tmppath, path) != 0) {
-                                    perror("[SS] undo rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                } else {
-                                    // Consume the undo snapshot after successful restore
-                                    unlink(undopath);
-                                    const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                                }
-                            }
-                        }
-                    }
-                } else if (strcmp(type, "HISTORY") == 0) {
-                    char file[128]; char ticket[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "HISTORY", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        // Build versions list
-                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
-                        DIR *d = opendir(dpath);
-                        char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"versions\":[");
-                        if (d) {
-                            size_t flen = strlen(file); int first=1; struct dirent *de;
-                            while ((de = readdir(d)) != NULL) {
-                                const char *name = de->d_name;
-                                if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                    const char *rest = name + flen + 1; char *ep=NULL; long val=strtol(rest,&ep,10);
-                                    if (ep && strcmp(ep, ".snap")==0 && val>0) {
-                                        if (!first) w += snprintf(resp+w, sizeof(resp)-w, ",");
-                                        first=0; w += snprintf(resp+w, sizeof(resp)-w, "%ld", val);
-                                    }
-                                }
-                            }
-                            closedir(d);
-                        }
-                        if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
-                        send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    }
-                } else if (strcmp(type, "REVERT") == 0) {
-                    char file[128]; char ticket[256]; int ver=0; char cname[256]; cname[0]='\0';
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    (void)json_get_int_field(buf, "version", &ver);
-                    (void)json_get_string_field(buf, "name", cname, sizeof(cname));
-                    if (!okf || !okt || ((ver<=0) && !cname[0])) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "REVERT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        // Save pre-revert into history
-                        char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen)==0) { history_save_snapshot(file, cur, clen); free(cur);} 
-                        // Load snapshot to revert to (by version or checkpoint name)
-                        char hpath[SS_PATH_MAX];
-                        if (cname[0]) snprintf(hpath, sizeof(hpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, cname);
-                        else snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, ver);
-                        char *snap=NULL; size_t slen=0;
-                        if (read_file_into(hpath, &snap, &slen) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
-                            if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.rvtmp", path); else { char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755); snprintf(tmppath, sizeof(tmppath), "%s", mp); strncat(tmppath, "/revert.tmp", sizeof(tmppath)-strlen(tmppath)-1);} 
-                            FILE *f = fopen(tmppath, "wb"); if (!f) { free(snap); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                            else { fwrite(snap, 1, slen, f); fflush(f); fclose(f); free(snap); if (rename(tmppath, path)!=0) { perror("[SS] revert rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } }
-                        }
-                    }
-                } else if (strcmp(type, "CHECKPOINT") == 0) {
-                    char file[128]; char ticket[256]; char name[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    int okn = (json_get_string_field(buf, "name", name, sizeof(name)) == 0);
-                    if (!okf || !okt || !okn || !name[0]) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "CHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
-                        else {
-                            char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
-                            ensure_parent_dirs_for(cpath);
-                            FILE *f = fopen(cpath, "wb"); if (!f) { free(cur); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
-                            else { fwrite(cur, 1, clen, f); fflush(f); fclose(f); free(cur); const char *ok="{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
-                        }
-                    }
-                } else if (strcmp(type, "LISTCHECKPOINTS") == 0) {
-                    char file[128]; char ticket[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "LISTCHECKPOINTS", g_ss_id) != 0 && ticket_validate(ticket, file, "VIEWCHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/checkpoints/%s", g_store_root, file);
-                        DIR *d = opendir(dpath);
-                        char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"checkpoints\":[");
-                        int first=1; if (d) {
-                            struct dirent *de; while ((de=readdir(d))!=NULL) {
-                                const char *n = de->d_name;
-                                size_t ln = strlen(n);
-                                if (ln > 4 && strcmp(n + ln - 4, ".chk") == 0) {
-                                    char name[256]; size_t sl = ln - 4; if (sl >= sizeof(name)) sl = sizeof(name)-1; memcpy(name, n, sl); name[sl]='\0';
-                                    if (!first) w += snprintf(resp+w, sizeof(resp)-w, ",");
-                                    first=0;
-                                    w += snprintf(resp+w, sizeof(resp)-w, "\"%s\"", name);
-                                }
-                            }
-                            closedir(d);
-                        }
-                        if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
-                        send_msg(cfd, resp, (uint32_t)strlen(resp));
-                    }
-                } else if (strcmp(type, "VIEWCHECKPOINT") == 0) {
-                    char file[128]; char ticket[256]; char name[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    int okn = (json_get_string_field(buf, "name", name, sizeof(name)) == 0);
-                    if (!okf || !okt || !okn) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "VIEWCHECKPOINT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
-                        char *content=NULL; size_t clen=0; if (read_file_into(cpath, &content, &clen) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
-                        else {
-                            char resp[8192]; resp[0]='\0';
-                            strncat(resp, "{\"status\":\"OK\",\"body\":\"", sizeof(resp)-strlen(resp)-1);
-                            json_escape_append(resp, sizeof(resp), content);
-                            strncat(resp, "\"}", sizeof(resp)-strlen(resp)-1);
-                            free(content);
-                            send_msg(cfd, resp, (uint32_t)strlen(resp));
-                        }
-                    }
-                } else if (strcmp(type, "RENAME") == 0) {
-                    char file[128], nfile[128];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okn = (json_get_string_field(buf, "newFile", nfile, sizeof(nfile)) == 0);
-                    if (!okf || !okn) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char path_old[SS_PATH_MAX]; snprintf(path_old, sizeof(path_old), "%s/files/%s", g_store_root, file);
-                        char path_new[SS_PATH_MAX]; snprintf(path_new, sizeof(path_new), "%s/files/%s", g_store_root, nfile);
-                        // Conflicts
-                        struct stat st;
-                        if (stat(path_old, &st) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else if (stat(path_new, &st) == 0) { const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            // Rename undo snapshot if present
-                            char u_old[SS_PATH_MAX]; snprintf(u_old, sizeof(u_old), "%s/undo/%s.undo", g_store_root, file);
-                            char u_new[SS_PATH_MAX]; snprintf(u_new, sizeof(u_new), "%s/undo/%s.undo", g_store_root, nfile);
-                            ensure_parent_dirs_for(u_new);
-                            if (stat(u_old, &st) == 0) { (void)rename(u_old, u_new); }
-                            // Rename checkpoints directory if present
-                            char c_old[SS_PATH_MAX]; snprintf(c_old, sizeof(c_old), "%s/checkpoints/%s", g_store_root, file);
-                            char c_new[SS_PATH_MAX]; snprintf(c_new, sizeof(c_new), "%s/checkpoints/%s", g_store_root, nfile);
-                            if (stat(c_old, &st) == 0) {
-                                ensure_parent_dirs_for(c_new);
-                                // Attempt directory rename (will move the folder atomically within same filesystem)
-                                (void)rename(c_old, c_new);
-                            }
-                            // Rename history snapshots
-                            char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
-                            DIR *d = opendir(dpath);
-                            if (d) {
-                                size_t flen = strlen(file); struct dirent *de;
-                                while ((de = readdir(d)) != NULL) {
-                                    const char *name = de->d_name;
-                                    if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                        char src[SS_PATH_MAX]; char dst[SS_PATH_MAX];
-                                        snprintf(src, sizeof(src), "%s/history/%s", g_store_root, name);
-                                        snprintf(dst, sizeof(dst), "%s/history/%s%s", g_store_root, nfile, name + flen);
-                                        ensure_parent_dirs_for(dst);
-                                        (void)rename(src, dst);
-                                    }
-                                }
-                                closedir(d);
-                            }
-                            // Finally rename main file
-                            ensure_parent_dirs_for(path_new);
-                            if (rename(path_old, path_new) != 0) { perror("[SS] rename main"); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                            else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        }
-                    }
-                } else if (strcmp(type, "PUT") == 0) {
-                    // Atomically replace file contents with provided body (raw text)
-                    char file[128]; char body[8192]; body[0]='\0';
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okb = (json_get_string_field(buf, "body", body, sizeof(body)) == 0);
-                    if (!okf || !okb) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        // Write to temp then rename
-                        char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
-                        if (pl + 5 + 1 <= sizeof(tmppath)) {
-                            snprintf(tmppath, sizeof(tmppath), "%s.ptmp", path);
-                        } else {
-                            char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755);
-                            snprintf(tmppath, sizeof(tmppath), "%s", mp);
-                            strncat(tmppath, "/put.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
-                        }
-                        fprintf(stderr, "[SS] PUT writing tmppath=%s final=%s len=%zu\n", tmppath, path, strlen(body)); fflush(stderr);
-                        ensure_parent_dirs_for(path);
-                        FILE *f = fopen(tmppath, "wb");
-                        if (!f) { perror("[SS] put fopen"); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            fwrite(body, 1, strlen(body), f); fflush(f); fclose(f);
-                            if (rename(tmppath, path) != 0) {
-                                perror("[SS] put rename");
-                                unlink(tmppath);
-                                const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                            } else {
-                                char cwd[512]; if (getcwd(cwd, sizeof(cwd))) fprintf(stderr, "[SS] PUT commit OK at %s -> %s\n", cwd, path);
-                                else fprintf(stderr, "[SS] PUT commit OK -> %s\n", path);
-                                const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
-                            }
-                        }
-                    }
-                } else if (strcmp(type, "INFO") == 0) {
-                    // Return file metadata: size (bytes), mtime, word count, char count
-                    char file[128]; char ticket[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0 && ticket_validate(ticket, file, "WRITE", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        struct stat st;
-                        if (stat(path, &st) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            // Read content to count words (best-effort)
-                            char *content=NULL; size_t clen=0; int words=0;
-                            if (read_file_into(path, &content, &clen) == 0 && content) {
-                                // Count words by splitting on spaces/newlines
-                                int in_word = 0; for (size_t i=0;i<clen;i++){ unsigned char c=(unsigned char)content[i]; if (c==' '||c=='\n' || c=='\t' || c=='\r'){ if (in_word){ words++; in_word=0; } } else { in_word=1; } }
-                                if (in_word) words++;
-                                free(content);
-                            }
-                            char resp[512];
-                            snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"size\":%lld,\"mtime\":%lld,\"atime\":%lld,\"words\":%d,\"chars\":%lld}",
-                                     (long long)st.st_size, (long long)st.st_mtime, (long long)st.st_atime, words, (long long)st.st_size);
-                            send_msg(cfd, resp, (uint32_t)strlen(resp));
-                        }
-                    }
-                } else if (strcmp(type, "STREAM") == 0) {
-                    // Stream content word-by-word with 0.1s delay; client reads until STOP
-                    char file[128]; char ticket[256];
-                    int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                    int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                    if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else if (ticket_validate(ticket, file, "READ", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                        char *content=NULL; size_t clen=0;
-                        if (read_file_into(path, &content, &clen) != 0 || !content) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            // Simple split by whitespace into words
-                            size_t i=0;
-                            while (i < clen) {
-                                while (i < clen && (content[i]==' ' || content[i]=='\n' || content[i]=='\t' || content[i]=='\r')) i++;
-                                size_t start=i;
-                                while (i < clen && !(content[i]==' ' || content[i]=='\n' || content[i]=='\t' || content[i]=='\r')) i++;
-                                if (i>start) {
-                                    size_t wlen = i-start; if (wlen > 256) wlen = 256;
-                                    char word[260]; memcpy(word, content+start, wlen); word[wlen]='\0';
-                                    char frame[320]; snprintf(frame, sizeof(frame), "{\"status\":\"OK\",\"word\":\"%s\"}", word);
-                                    if (send_msg(cfd, frame, (uint32_t)strlen(frame)) != 0) break;
-                                    {
-                                        struct timeval tv; tv.tv_sec = 0; tv.tv_usec = 100000; // 0.1s
-                                        select(0, NULL, NULL, NULL, &tv);
-                                    }
-                                }
-                            }
-                            free(content);
-                            const char *stop = "{\"status\":\"STOP\"}"; send_msg(cfd, stop, (uint32_t)strlen(stop));
-                        }
-                    }
-                } else {
-                    const char *resp = "{\"status\":\"ERR_BADREQ\"}";
-                    send_msg(cfd, resp, (uint32_t)strlen(resp));
-                }
-            } else {
-                const char *resp = "{\"status\":\"ERR_BADREQ\"}";
-                send_msg(cfd, resp, (uint32_t)strlen(resp));
-            }
-            free(buf);
+        pthread_t th;
+        conn_args_t *ca = (conn_args_t *)malloc(sizeof(conn_args_t));
+        if (!ca) { close(cfd); continue; }
+        ca->cfd = cfd;
+        // spawn detached thread
+        if (pthread_create(&th, NULL, ss_conn_handler, ca) == 0) {
+            pthread_detach(th);
+        } else {
+            close(cfd); free(ca);
         }
-        if (ws.active) { lock_release(ws.file, ws.sentence_idx); ss_tokens_free(&ws.doc); if (ws.pre_image) free(ws.pre_image); }
-        close(cfd);
     }
     close(lfd);
     return NULL;

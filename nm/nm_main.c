@@ -5,12 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 #include <time.h>
 
 #include "../common/net_proto.h"
 #include "nm_persist.h"
 #include "nm_dir.h"
 #include "../common/tickets.h"
+#include <errno.h>
 
 #define BACKLOG 64
 
@@ -1069,24 +1072,52 @@ static void *client_thread(void *arg) {
                                     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) { send_msg(fd, r, rl); free(r);} else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } close(sfd); }
                                     else {
                                         char body[8192]; body[0]='\0'; (void)json_get_string_field(r, "body", body, sizeof(body)); free(r); close(sfd);
-                                        // Execute via /bin/sh using temp files to capture output
-                                        char tmps[512]; snprintf(tmps, sizeof(tmps), "/tmp/nm_exec_%d.sh", getpid());
-                                        FILE *tf = fopen(tmps, "wb"); if (!tf) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                                        else {
-                                            fwrite(body, 1, strlen(body), tf); fflush(tf); fclose(tf);
-                                            char tmpout[512]; snprintf(tmpout, sizeof(tmpout), "/tmp/nm_exec_%d.out", getpid());
-                                            char cmd[1100]; snprintf(cmd, sizeof(cmd), "/bin/sh '%s' > '%s' 2>&1", tmps, tmpout);
-                                            int rc = system(cmd);
-                                            (void)rc; // even if non-zero, we capture stderr/stdout
-                                            FILE *rf = fopen(tmpout, "rb");
-                                            if (!rf) { unlink(tmps); unlink(tmpout); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                                            else {
-                                                char outbuf[8192]; size_t w=0; int c;
-                                                while ((c = fgetc(rf)) != EOF) { if (w + 1 < sizeof(outbuf)) outbuf[w++] = (char)c; }
-                                                outbuf[w] = '\0'; fclose(rf); unlink(tmps); unlink(tmpout);
-                                                // escape JSON
+                                        // Execute via /bin/sh reading the script from stdin; capture stdout+stderr via pipe
+                                        int out_pipe[2]; int in_pipe[2];
+                                        if (pipe(out_pipe) != 0 || pipe(in_pipe) != 0) {
+                                            const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
+                                        } else {
+                                            pid_t pid = fork();
+                                            if (pid < 0) {
+                                                close(out_pipe[0]); close(out_pipe[1]); close(in_pipe[0]); close(in_pipe[1]);
+                                                const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
+                                            } else if (pid == 0) {
+                                                // Child: stdin <- in_pipe[0], stdout/stderr -> out_pipe[1]
+                                                dup2(in_pipe[0], STDIN_FILENO);
+                                                dup2(out_pipe[1], STDOUT_FILENO);
+                                                dup2(out_pipe[1], STDERR_FILENO);
+                                                // Close inherited fds
+                                                close(in_pipe[0]); close(in_pipe[1]);
+                                                close(out_pipe[0]); close(out_pipe[1]);
+                                                // Exec /bin/sh -s (read from stdin)
+                                                execl("/bin/sh", "sh", "-s", (char *)NULL);
+                                                _exit(127);
+                                            } else {
+                                                // Parent: write script to child's stdin, then read output
+                                                close(in_pipe[0]); close(out_pipe[1]);
+                                                size_t bl = strlen(body); size_t off = 0; 
+                                                while (off < bl) {
+                                                    ssize_t wn = write(in_pipe[1], body + off, bl - off);
+                                                    if (wn < 0) {
+                                                        if (errno == EINTR) continue;
+                                                        break;
+                                                    }
+                                                    off += (size_t)wn;
+                                                }
+                                                close(in_pipe[1]);
+                                                char outbuf[8192]; size_t w=0; char tmp[512]; ssize_t nrd;
+                                                while ((nrd = read(out_pipe[0], tmp, sizeof(tmp))) > 0) {
+                                                    size_t copy = (size_t)nrd;
+                                                    if (w + copy >= sizeof(outbuf)) copy = sizeof(outbuf) - 1 - w;
+                                                    if (copy > 0) { memcpy(outbuf + w, tmp, copy); w += copy; if (w >= sizeof(outbuf)-1) break; }
+                                                }
+                                                if (w < sizeof(outbuf)) outbuf[w] = '\0'; else outbuf[sizeof(outbuf)-1] = '\0';
+                                                close(out_pipe[0]);
+                                                int status=0; (void)waitpid(pid, &status, 0);
+                                                // Build JSON response
                                                 char j[16384]; j[0]='\0'; strncat(j, "{\"status\":\"OK\",\"output\":\"", sizeof(j)-strlen(j)-1);
-                                                for (size_t i=0;i<w && strlen(j)+2<sizeof(j);++i){ char ch=outbuf[i]; if (ch=='"' || ch=='\\') strncat(j, "\\", sizeof(j)-strlen(j)-1); if (ch=='\n') strncat(j, "\\n", sizeof(j)-strlen(j)-1); else { char s[2]={ch,0}; strncat(j,s, sizeof(j)-strlen(j)-1);} }
+                                                size_t wlen = strlen(outbuf);
+                                                for (size_t i=0;i<wlen && strlen(j)+2<sizeof(j);++i){ char ch=outbuf[i]; if (ch=='"' || ch=='\\') strncat(j, "\\", sizeof(j)-strlen(j)-1); if (ch=='\n') strncat(j, "\\n", sizeof(j)-strlen(j)-1); else { char s[2]={ch,0}; strncat(j,s, sizeof(j)-strlen(j)-1);} }
                                                 strncat(j, "\"}", sizeof(j)-strlen(j)-1);
                                                 send_msg(fd, j, (uint32_t)strlen(j));
                                             }
