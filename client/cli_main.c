@@ -331,6 +331,54 @@ static void print_human(const char *who, const char *json) {
             }
         }
         if (strstr(json, "\"files\":[")) {
+            // VIEWFOLDER support: when response also contains folders, print both and return
+            if (strstr(json, "\"folders\":[")) {
+                // Optional header: show folder path (use ~/ for root)
+                char vpath[256]; vpath[0]='\0';
+                if (json_get_string_field(json, "path", vpath, sizeof(vpath)) == 0) {
+                    if (strcmp(vpath, "~") == 0) printf("~/\n"); else printf("%s/\n", vpath);
+                }
+                // Print folders
+                const char *pf = strstr(json, "\"folders\":");
+                if (pf) {
+                    pf = strchr(pf, '[');
+                    if (pf) {
+                        pf++;
+                        int fcount = 0;
+                        while (*pf && *pf != ']') {
+                            while (*pf==' '||*pf=='\n'||*pf=='\t'||*pf==',') pf++;
+                            if (*pf=='"') {
+                                pf++; const char *s=pf; while(*pf && *pf!='"') pf++; size_t n=(size_t)(pf-s);
+                                char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0'; if (*pf=='"') pf++;
+                                printf("--/ %s/\n", name); // folder with trailing slash
+                                fcount++;
+                            } else break;
+                        }
+                        if (fcount==0) {
+                            // optional: print nothing when no folders
+                            (void)0;
+                        }
+                    }
+                }
+                // Print files
+                const char *p2 = strstr(json, "\"files\":");
+                if (p2) {
+                    p2 = strchr(p2, '['); if (p2) { p2++;
+                        int count=0;
+                        while (*p2 && *p2!=']') {
+                            while (*p2==' '||*p2=='\n'||*p2=='\t'||*p2==',') p2++;
+                            if (*p2=='"') {
+                                p2++; const char *s=p2; while(*p2 && *p2!='"') p2++; size_t n=(size_t)(p2-s);
+                                char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0'; if (*p2=='"') p2++;
+                                printf("--> %s\n", name);
+                                count++;
+                            } else break;
+                        }
+                        // If both empty, print nothing (silent like other list outputs)
+                    }
+                }
+                return;
+            }
             // VIEW basic list
             const char *p = strstr(json, "["); if (!p) { printf("OK\n"); return; }
             p++;
@@ -552,6 +600,39 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload)-strlen(payload)-1);
+        // Send request then stream frames until STOP
+        if (send_msg(fd, payload, (uint32_t)strlen(payload)) != 0) { perror("send EXEC"); close(fd); return 1; }
+        int started=0;
+        for (;;) {
+            char *fr=NULL; uint32_t fl=0; if (recv_msg(fd, &fr, &fl) != 0) { fprintf(stderr, "ERROR: EXEC stream interrupted\n"); close(fd); return 1; }
+            char st[32]={0}; (void)json_get_string_field(fr, "status", st, sizeof(st));
+            if (strcmp(st, "STOP") == 0) {
+                int ec=0; (void)json_get_int_field(fr, "exit", &ec);
+                free(fr);
+                if (ec!=0) printf("\n(exit code %d)\n", ec);
+                else printf("\n(done)\n");
+                break;
+            }
+            if (!started && strcmp(st, "OK") == 0 && strstr(fr, "\"stream\":\"EXEC\"")) {
+                // initial marker
+                started=1; free(fr); continue;
+            }
+            if (strcmp(st, "OK") == 0) {
+                char chunk[1200]; chunk[0]='\0';
+                if (json_get_string_field(fr, "chunk", chunk, sizeof(chunk)) == 0) {
+                    // print without additional formatting (already decoded newlines by server escaping rules -> contains literal \n sequences we need to convert?)
+                    // Replace escaped newlines with real newlines for nicer output
+                    for (size_t i=0; i<strlen(chunk); ++i) {
+                        if (chunk[i]=='\\' && chunk[i+1]=='n') { fputc('\n', stdout); i++; } else if (chunk[i]=='\\' && chunk[i+1]=='r') { /* ignore carriage */ i++; } else { fputc(chunk[i], stdout); }
+                    }
+                    fflush(stdout);
+                }
+                free(fr); continue;
+            }
+            // Any other status -> print via print_human and abort
+            print_human("NM", fr); free(fr); break;
+        }
+        close(fd); return 0;
     } else if (CMDEQ(cmd, "READ")) {
         if (argc < 5) { fprintf(stderr, "read requires <file>\n"); close(fd); return 1; }
         const char *file = argv[4];

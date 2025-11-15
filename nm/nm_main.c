@@ -275,129 +275,35 @@ static void *client_thread(void *arg) {
                         fprintf(stderr, "[NM] LOOKUP WRITE auto-provision chosen_ssid=%d data_port=%d\n", chosen_ssid, data_port);
                         if (data_port == 0) {
                             const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-                            // fallthrough to error return
                         } else {
                             int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
                             if (sfd >= 0) {
-                                char req[256]; req[0] = '\0';
-                                json_put_string_field(req, sizeof(req), "type", "CREATE", 1);
-                                json_put_string_field(req, sizeof(req), "file", file, 0);
-                                strncat(req, "}", sizeof(req) - strlen(req) - 1);
+                                char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "CREATE", 1); json_put_string_field(req, sizeof(req), "file", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
-                                    char *r = NULL; uint32_t rl = 0;
-                                    if (recv_msg(sfd, &r, &rl) == 0 && r) {
-                                        if (strstr(r, "\"status\":\"OK\"") || strstr(r, "ERR_CONFLICT")) {
-                                            nm_dir_set(file, chosen_ssid);
-                                            nm_acl_set_owner(file, user);
-                                            nm_acl_grant(file, user, ACL_R|ACL_W);
-                                            // choose a replica if any other SS available
-                                            int repls[4]; size_t nr=0;
-                                            pthread_mutex_lock(&g_mu);
-                                            for (ss_entry_t *se=g_ss_list; se; se=se->next) if (se->ss_id != chosen_ssid) { if (nr < 4) repls[nr++] = se->ss_id; }
-                                            pthread_mutex_unlock(&g_mu);
-                                            if (nr>0) nm_state_set_replicas(file, repls, 1);
-                                            (void)nm_state_save("nm_state.json");
-                                            ssid = chosen_ssid;
-                                            fprintf(stderr, "[NM] mapping set %s -> ssId=%d\n", file, ssid);
-                                        }
-                                    }
+                                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) { nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W); (void)nm_state_save("nm_state.json"); }
                                     if (r) free(r);
                                 }
                                 close(sfd);
                             }
+                            // After creation attempt, build ticket
+                            int ssid_created=0; if (nm_state_find_dir(file, &ssid_created)==0) {
+                                char ticket2[256]; if (ticket_build(file, op, ssid_created, 600, ticket2, sizeof(ticket2))==0) {
+                                    int dport2=0; pthread_mutex_lock(&g_mu); for(ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid_created){ dport2=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
+                                    if (dport2){ char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", "127.0.0.1", dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2)); }
+                                    else { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                } else { const char *er="{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                            } else { const char *er="{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                         }
                     } else {
-                        const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-                        // done
-                        goto lookup_done;
+                        const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                     }
-                }
-                // Resolve data port for primary or failover to a live replica
-                {
-                    int data_port = 0; int target_ssid = ssid;
-                    pthread_mutex_lock(&g_mu);
-                    for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->ss_id == ssid) { if (e->is_up) data_port = e->ss_data_port; break; } }
-                    pthread_mutex_unlock(&g_mu);
-                    if (data_port == 0) {
-                        int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
-                        for (size_t i=0;i<nr;i++) {
-                            int rp = get_data_port_for(repls[i]); int up=0; pthread_mutex_lock(&g_mu); ss_entry_t *re = find_ss_nolock(repls[i]); if (re && re->is_up) up=1; pthread_mutex_unlock(&g_mu);
-                            if (up && rp) { data_port = rp; target_ssid = repls[i]; break; }
-                        }
-                        if (data_port && target_ssid != ssid) {
-                            nm_dir_set(file, target_ssid);
-                            int new_reps[16]; size_t nnr = 0;
-                            new_reps[nnr++] = ssid;
-                            for (size_t i=0;i<nr && nnr<16;i++) { if (repls[i] == target_ssid || repls[i] == ssid) continue; new_reps[nnr++] = repls[i]; }
-                            nm_state_set_replicas(file, new_reps, nnr);
-                            (void)nm_state_save("nm_state.json");
-                            fprintf(stderr, "[NM] LOOKUP failover: promoted ssId=%d for %s; old primary %d set as replica\n", target_ssid, file, ssid);
-                            ssid = target_ssid;
-                        }
-                    }
-                    if (data_port == 0) {
-                        const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
+                } else {
+                    // File exists: build ticket
+                    if ((strcmp(op, "READ") == 0 && nm_acl_check(file, user, "READ") != 0) || (strcmp(op, "WRITE") == 0 && nm_acl_check(file, user, "WRITE") != 0)) {
+                        const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                     } else {
-                        if (nm_acl_check(file, user, op) != 0) {
-                            const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er));
-                        } else {
-                            char ticket[256];
-                            if (ticket_build(file, op, ssid, 600, ticket, sizeof(ticket)) != 0) {
-                                const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
-                            } else {
-                                char resp[512];
-                                fprintf(stderr, "[NM] LOOKUP mapped file=%s ssId=%d data_port=%d\n", file, ssid, data_port);
-                                snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"ssAddr\":\"127.0.0.1\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", data_port, ticket);
-                                send_msg(fd, resp, (uint32_t)strlen(resp));
-                            }
-                        }
-                    }
-                }
-            }
-lookup_done: ;
-        } else if (strcmp(type, "CREATE") == 0) {
-            char file[128]; char user[128]; user[0]='\0'; (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
-            int publicRead = 0, publicWrite = 0; (void)json_get_int_field(buf, "publicRead", &publicRead); (void)json_get_int_field(buf, "publicWrite", &publicWrite);
-            if (json_get_string_field(buf, "file", file, sizeof(file)) != 0) {
-                const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
-            } else {
-                int exists = (nm_state_find_dir(file, NULL) == 0);
-                if (exists) { const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                else {
-                    // pick first SS
-                    pthread_mutex_lock(&g_mu);
-                    ss_entry_t *e = g_ss_list; int data_port = e ? e->ss_data_port : 0; int ssid = e ? e->ss_id : 0;
-                    pthread_mutex_unlock(&g_mu);
-                    if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                    else {
-                        int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
-                        if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
-                        else {
-                            char req[256]; req[0] = '\0';
-                            json_put_string_field(req, sizeof(req), "type", "CREATE", 1);
-                            json_put_string_field(req, sizeof(req), "file", file, 0);
-                            strncat(req, "}", sizeof(req) - strlen(req) - 1);
-                            if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
-                                char *r = NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) == 0 && r) {
-                                    if (strstr(r, "\"status\":\"OK\"")) { nm_dir_set(file, ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
-                                        if (publicRead || publicWrite) {
-                                            int anonPerm = 0;
-                                            if (publicWrite) anonPerm |= (ACL_R | ACL_W); // write implies read for anonymous
-                                            if (publicRead) anonPerm |= ACL_R;
-                                            if (anonPerm) nm_acl_grant(file, "anonymous", anonPerm);
-                                        }
-                                        // choose a replica and replicate CREATE asynchronously
-                                        int repls[4]; size_t nr=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *se=g_ss_list; se; se=se->next){ if (se->ss_id!=ssid && nr<4) repls[nr++]=se->ss_id; } pthread_mutex_unlock(&g_mu);
-                                        if (nr>0) { nm_state_set_replicas(file, repls, 1); schedule_cmd_repl("CREATE", file, NULL, repls[0]); }
-                                        (void)nm_state_save("nm_state.json");
-                                        const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok)); }
-                                    else if (strstr(r, "ERR_CONFLICT")) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                                    else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                                } else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                                free(r);
-                            } else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                            close(sfd);
-                        }
+                        char ticket2[256]; if (ticket_build(file, op, ssid, 600, ticket2, sizeof(ticket2)) != 0) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                        else { int dport2=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ dport2=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu); if (dport2){ char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", "127.0.0.1", dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2)); } else { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } }
                     }
                 }
             }
@@ -638,9 +544,19 @@ lookup_done: ;
                 const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
             }
         } else if (strcmp(type, "VIEWFOLDER") == 0) {
-            char path[256]; path[0]='\0'; (void)json_get_string_field(buf, "path", path, sizeof(path));
+            char in_path[256]; in_path[0]='\0'; (void)json_get_string_field(buf, "path", in_path, sizeof(in_path));
+            // Normalize: treat "~" or "/" or empty as root; include a label in response
+            const char *label = NULL;
+            char path[256]; // effective path used for filtering
+            if (in_path[0] == '\0' || (strcmp(in_path, "~")==0) || (strcmp(in_path, "/")==0)) {
+                path[0] = '\0';
+                label = "~";
+            } else {
+                snprintf(path, sizeof(path), "%s", in_path);
+                label = in_path;
+            }
             // Build listing: immediate child folders and files under path
-            char resp[8192]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"folders\":[");
+            char resp[8192]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"path\":\"%s\",\"folders\":[", label);
             // Folders
             char folders[512][256]; size_t nf = nm_state_get_folders(folders, 512); int first=1;
             size_t plen = strlen(path);

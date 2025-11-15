@@ -824,6 +824,13 @@ int nm_acl_check(const char *file, const char *user, const char *op) {
     if (strcmp(op, "READ") == 0 || strcmp(op, "VIEWCHECKPOINT") == 0 || strcmp(op, "LISTCHECKPOINTS") == 0) need = ACL_R; // read-like
     else need = ACL_W; // WRITE/UNDO/REVERT and others require W
     for (size_t i=0;i<e->n_grants;i++){ if (strcmp(e->grants[i].user, user)==0){ if ((e->grants[i].perm & need) == need) return 0; else return -1; }}
+    // Fallback: if 'anonymous' has the required permission, allow any user
+    for (size_t i=0;i<e->n_grants;i++) {
+        if (strcmp(e->grants[i].user, "anonymous")==0) {
+            if ((e->grants[i].perm & need) == need) return 0;
+            break;
+        }
+    }
     return -1;
 }
 
