@@ -1,9 +1,10 @@
 {
-  "users":["naman","manav","arnav","hemang"],
-  "active":[],
-  "directory":{"NAMAN":1,"bhosda.txt":1,"c.tct":1,"bash.sh":1,"new.txt":1,"new/b1.txt":1,"a2.txt":1,"f1.txt":1},
-  "acls":{"NAMAN":{"owner":"owner","grants":{"naman":"RW","manav":"RW"}},"f1.txt":{"owner":"manav","grants":{"manav":"RW","naman":"RW"}}},
-  "replicas":{"NAMAN":[2],"bhosda.txt":[2],"c.tct":[2],"bash.sh":[2],"new.txt":[2],"new/b1.txt":[],"a2.txt":[],"f1.txt":[]},
-  "requests":{"NAMAN":[{"user":"manav","mode":"R"}],"a2.txt":[{"user":"naman","mode":"W"},{"user":"hemang","mode":"R"},{"user":"arnav","mode":"R"}],"f1.txt":[]},
-  "folders":["NAMAN/","new"]
+  "users":["a","b","c"],
+  "active":["a","b","c"],
+  "directory":{"banja/test.txt":2,"FOLDER":2},
+  "acls":{"banja/test.txt":{"owner":"a","grants":{"a":"RW","anonymous":"RW","b":"RW"}},"FOLDER":{"owner":"b","grants":{"b":"RW"}}},
+  "replicas":{"banja/test.txt":[1],"FOLDER":[1]},
+  "requests":{},
+  "folders":["fol","banja"],
+  "trash":[]
 }

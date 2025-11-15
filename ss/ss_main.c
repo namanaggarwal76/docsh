@@ -35,6 +35,7 @@ static pthread_mutex_t g_lock_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // Forward declaration (defined later in file)
 static void ensure_parent_dirs_for(const char *path);
+static void history_save_snapshot(const char *file, const char *data, size_t len);
 
 // Snapshot-based read isolation removed; readers always see the latest committed file.
 
@@ -85,6 +86,7 @@ static void ensure_dirs(void) {
     snprintf(p, sizeof(p), "%s/meta", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/undo", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/checkpoints", g_store_root); mkdir(p, 0755);
+    snprintf(p, sizeof(p), "%s/history", g_store_root); mkdir(p, 0755);
 }
 
 static void *heartbeat_thread(void *arg) {
@@ -130,6 +132,40 @@ static void ensure_parent_dirs_for(const char *path) {
 // Create a single-level undo snapshot for file_path into undo_path if not already present.
 // If the source file doesn't exist, create an empty undo file (so UNDO restores to empty).
 // (removed) save_undo_snapshot: replaced by session-based snapshot writing in END_WRITE
+
+// Best-effort history snapshot: stores the provided data into
+//   <g_store_root>/history/<file>.<N>.snap
+// where N is 1 + max existing version for that file. Creates directories if needed.
+static void history_save_snapshot(const char *file, const char *data, size_t len) {
+    if (!file || !file[0]) return;
+    char hdir[SS_PATH_MAX]; snprintf(hdir, sizeof(hdir), "%s/history", g_store_root);
+    // Ensure history directory exists
+    mkdir(hdir, 0755);
+    int next = 1;
+    DIR *d = opendir(hdir);
+    if (d) {
+        size_t flen = strlen(file);
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            const char *name = de->d_name;
+            if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
+                const char *rest = name + flen + 1;
+                char *ep = NULL; long val = strtol(rest, &ep, 10);
+                if (ep && strcmp(ep, ".snap") == 0 && val >= next) {
+                    if (val + 1 > next) next = (int)(val + 1);
+                }
+            }
+        }
+        closedir(d);
+    }
+    char hpath[SS_PATH_MAX]; snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, next);
+    ensure_parent_dirs_for(hpath);
+    FILE *f = fopen(hpath, "wb");
+    if (!f) { perror("[SS] history fopen"); return; }
+    if (data && len > 0) { (void)fwrite(data, 1, len, f); }
+    fflush(f); fclose(f);
+    fprintf(stderr, "[SS] history snapshot saved: %s (len=%zu)\n", hpath, len);
+}
 
 static void json_escape_append(char *dst, size_t dst_sz, const char *s) {
     while (*s && strlen(dst) + 2 < dst_sz) {
