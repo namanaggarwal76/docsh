@@ -122,7 +122,7 @@ MOVE docs/note.txt docs/notes.txt
 RENAME docs/notes.txt docs/todo.txt
 ```
 
-6) Execute scripts via NM
+6) Execute scripts via NM (streaming output)
 ```bash
 # Save a bash script into a file (via WRITE) and then execute it at the NM
 WRITE tools/diag.sh 0
@@ -134,7 +134,7 @@ WRITE tools/diag.sh 0
 ETIRW
 
 EXEC tools/diag.sh
-# Output will be combined stdout/stderr from /bin/bash with no special-casing.
+# Output streams live (stdout+stderr mixed) until completion; final line shows exit code if non-zero.
 ```
 
 7) Trash can (soft delete)

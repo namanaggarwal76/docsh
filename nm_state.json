@@ -1,9 +1,9 @@
 {
-  "users":["a","b","c"],
+  "users":["a","b","c","manav","alice"],
   "active":["a","b","c"],
-  "directory":{"banja/test.txt":2,"FOLDER":2},
-  "acls":{"banja/test.txt":{"owner":"a","grants":{"a":"RW","anonymous":"RW","b":"RW"}},"FOLDER":{"owner":"b","grants":{"b":"RW"}}},
-  "replicas":{"banja/test.txt":[1],"FOLDER":[1]},
+  "directory":{"banja/test.txt":1,"FOLDER":1,"demo.txt":1},
+  "acls":{"banja/test.txt":{"owner":"owner","grants":{"a":"RW","anonymous":"RW","b":"RW"}},"demo.txt":{"owner":"alice","grants":{"alice":"RW","anonymous":"R"}}},
+  "replicas":{"banja/test.txt":[2],"FOLDER":[2],"demo.txt":[]},
   "requests":{},
   "folders":["fol","banja"],
   "trash":[]

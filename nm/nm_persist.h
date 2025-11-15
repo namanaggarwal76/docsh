@@ -60,6 +60,21 @@ int nm_state_get_primary(const char *file, int *out_ssid);
 #define ACL_R 1
 #define ACL_W 2
 
+/* ACL MODEL (Unified)
+ * --------------------
+ * Permissions are stored per FILE, not per USER.
+ * Each file has:
+ *   - owner: single username with implicit RW
+ *   - grants[]: dynamic array of (user, perm) where perm bitmask uses ACL_R (1) | ACL_W (2)
+ * Anonymous/public access is represented by a grant with user="anonymous" (perm may include R and/or W).
+ * All authorization checks call nm_acl_check(file, user, op), which:
+ *   - Allows owner automatically
+ *   - Maps op to required perm (READ-like => R; WRITE/UNDO/REVERT/etc => W; W implies R when granted)
+ *   - Searches grants for exact user or falls back to the anonymous grant
+ * There is intentionally NO global user-centric permission index; all lookups traverse the file's grants.
+ * This file-centric design simplifies rename/move operations and persistence.
+ */
+
 // Set or update owner for a file (owner always has RW)
 int nm_acl_set_owner(const char *file, const char *owner);
 

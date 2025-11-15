@@ -307,6 +307,38 @@ static void *client_thread(void *arg) {
                     }
                 }
             }
+        } else if (strcmp(type, "CREATE") == 0) {
+            // Explicit CREATE: create empty file mapping and optional public ACL flags
+            char file[128]; char user[128]; user[0]='\0'; int pubR=0, pubW=0;
+            (void)json_get_string_field(buf, "user", user, sizeof(user)); if(!user[0]) snprintf(user,sizeof(user),"%s","anonymous");
+            int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+            (void)json_get_int_field(buf, "publicRead", &pubR); (void)json_get_int_field(buf, "publicWrite", &pubW);
+            if (!okf) { const char *er = "{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                // conflict check
+                if (nm_state_find_dir(file, NULL) == 0) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                else {
+                    // pick least loaded SS
+                    int chosen_ssid=0, data_port=0; if (pick_least_loaded_ss(&chosen_ssid, &data_port)!=0 || data_port==0) { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                    else {
+                        int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                        if (sfd < 0) { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                        else {
+                            char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "CREATE", 1); json_put_string_field(req, sizeof(req), "file", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                            if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                            else {
+                                char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                    nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
+                                    if (pubR || pubW) { int anonPerm=0; if (pubR) anonPerm |= ACL_R; if (pubW) anonPerm |= (ACL_R|ACL_W); if (anonPerm) nm_acl_grant(file, "anonymous", anonPerm); }
+                                    (void)nm_state_save("nm_state.json"); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+                                } else { const char *er="{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                                if (r) free(r);
+                            }
+                            close(sfd);
+                        }
+                    }
+                }
+            }
         } else if (strcmp(type, "DELETE") == 0) {
             // Soft delete: move file to .trash and record in NM state
             char file[128]; char user[128]; user[0]='\0';
