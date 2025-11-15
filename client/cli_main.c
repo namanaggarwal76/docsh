@@ -681,7 +681,7 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { perror("send STREAM"); close(sfd); return 1; }
         // receive frames until STOP
         int first=1; for (;;) {
-            char *fr=NULL; uint32_t fl=0; if (recv_msg(sfd, &fr, &fl) != 0) { fprintf(stderr, "\nERROR: streaming interrupted\n"); close(sfd); return 1; }
+            char *fr=NULL; uint32_t fl=0; if (recv_msg(sfd, &fr, &fl) != 0 || !fr || fl==0) { fprintf(stderr, "\nERROR: service unavailable (stream interrupted)\n"); close(sfd); return 1; }
             char st[16]={0}; (void)json_get_string_field(fr, "status", st, sizeof(st));
             if (strcmp(st, "STOP")==0) { free(fr); break; }
             char word[260]={0}; if (json_get_string_field(fr, "word", word, sizeof(word)) == 0) {
