@@ -23,6 +23,7 @@ typedef struct ss_entry {
     int ss_id;
     int ss_ctrl_port;
     int ss_data_port;
+    char ss_addr[64];
     time_t last_heartbeat;
     int is_up;
     struct ss_entry *next;
@@ -31,10 +32,12 @@ typedef struct ss_entry {
 static ss_entry_t *g_ss_list = NULL;
 static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
 
-static void add_ss(int id, int ctrl, int data) {
+static void add_ss(int id, int ctrl, int data, const char *addr) {
     pthread_mutex_lock(&g_mu);
     ss_entry_t *e = (ss_entry_t *)malloc(sizeof(ss_entry_t));
-    e->ss_id = id; e->ss_ctrl_port = ctrl; e->ss_data_port = data; e->last_heartbeat = time(NULL); e->is_up = 1; e->next = g_ss_list; g_ss_list = e;
+    e->ss_id = id; e->ss_ctrl_port = ctrl; e->ss_data_port = data;
+    snprintf(e->ss_addr, sizeof(e->ss_addr), "%s", addr);
+    e->last_heartbeat = time(NULL); e->is_up = 1; e->next = g_ss_list; g_ss_list = e;
     pthread_mutex_unlock(&g_mu);
 }
 
@@ -43,13 +46,17 @@ static ss_entry_t *find_ss_nolock(int id) {
     return NULL;
 }
 
-static int get_data_port_for(int ssid) {
-    int port = 0;
+static int get_ss_info(int ssid, int *out_port, char *out_addr, size_t addr_sz) {
     pthread_mutex_lock(&g_mu);
     ss_entry_t *e = find_ss_nolock(ssid);
-    if (e) port = e->ss_data_port;
+    if (e) {
+        if (out_port) *out_port = e->ss_data_port;
+        if (out_addr && addr_sz > 0) snprintf(out_addr, addr_sz, "%s", e->ss_addr);
+        pthread_mutex_unlock(&g_mu);
+        return 0;
+    }
     pthread_mutex_unlock(&g_mu);
-    return port;
+    return -1;
 }
 
 // Replication queue metric
@@ -61,10 +68,10 @@ static int repq_get(void) { pthread_mutex_lock(&g_rep_mu); int v = g_replication
 
 // Helper: fetch whole file text from a given SS (by ssid) using READ ticket
 static int fetch_file_from_ss(const char *file, int ssid, char *out_body, size_t out_sz) {
-    int data_port = get_data_port_for(ssid);
-    if (data_port == 0) return -1;
+    int data_port = 0; char ss_addr[64];
+    if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port == 0) return -1;
     char ticket[256]; if (ticket_build(file, "READ", ssid, 600, ticket, sizeof(ticket)) != 0) return -1;
-    int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) return -1;
+    int sfd = tcp_connect(ss_addr, (uint16_t)data_port); if (sfd < 0) return -1;
     char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "READ", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
     if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); return -1; }
     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) free(r); close(sfd); return -1; }
@@ -79,9 +86,9 @@ static void *repl_put_thread(void *arg) {
     repl_put_args_t *a = (repl_put_args_t *)arg;
     char body[8192]; body[0]='\0';
     if (fetch_file_from_ss(a->file, a->primary_ssid, body, sizeof(body)) == 0) {
-        int dport = get_data_port_for(a->target_ssid);
-        if (dport) {
-            int dfd = tcp_connect("127.0.0.1", (uint16_t)dport);
+        int dport = 0; char dest_addr[64];
+        if (get_ss_info(a->target_ssid, &dport, dest_addr, sizeof(dest_addr)) == 0 && dport) {
+            int dfd = tcp_connect(dest_addr, (uint16_t)dport);
             if (dfd >= 0) {
                 char req[9216]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "PUT", 1); json_put_string_field(req, sizeof(req), "file", a->file, 0); json_put_string_field(req, sizeof(req), "body", body, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                 (void)send_msg(dfd, req, (uint32_t)strlen(req)); char *rr=NULL; uint32_t rrl=0; (void)recv_msg(dfd, &rr, &rrl); if (rr) free(rr); close(dfd);
@@ -104,9 +111,9 @@ static void schedule_put_repl(const char *file, int primary_ssid, int target_ssi
 typedef struct { char type[16]; char file[128]; char newfile[128]; int target_ssid; } repl_cmd_args_t;
 static void *repl_cmd_thread(void *arg) {
     repl_cmd_args_t *a = (repl_cmd_args_t*)arg;
-    int dport = get_data_port_for(a->target_ssid);
-    if (dport) {
-        int dfd = tcp_connect("127.0.0.1", (uint16_t)dport);
+    int dport = 0; char dest_addr[64];
+    if (get_ss_info(a->target_ssid, &dport, dest_addr, sizeof(dest_addr)) == 0 && dport) {
+        int dfd = tcp_connect(dest_addr, (uint16_t)dport);
         if (dfd >= 0) {
             char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", a->type, 1); json_put_string_field(req, sizeof(req), "file", a->file, 0); if (strcmp(a->type, "RENAME")==0) json_put_string_field(req, sizeof(req), "newFile", a->newfile, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
             (void)send_msg(dfd, req, (uint32_t)strlen(req)); char *r=NULL; uint32_t rl=0; (void)recv_msg(dfd, &r, &rl); if (r) free(r); close(dfd);
@@ -172,7 +179,7 @@ static void *hb_monitor_thread(void *arg) {
     return NULL;
 }
 
-static int pick_least_loaded_ss(int *out_ssid, int *out_data_port) {
+static int pick_least_loaded_ss(int *out_ssid, int *out_data_port, char *out_addr, size_t addr_sz) {
     // Count mappings per SS
     int counts[1024]; int ssids[1024]; int nss=0;
     pthread_mutex_lock(&g_mu);
@@ -187,15 +194,16 @@ static int pick_least_loaded_ss(int *out_ssid, int *out_data_port) {
     if (nss == 0) return -1;
     int best = 0; for (int j=1; j<nss; ++j) if (counts[j] < counts[best]) best = j;
     int chosen_ssid = ssids[best];
-    int data_port = 0;
+    int data_port = 0; char ss_addr[64] = "127.0.0.1";
     pthread_mutex_lock(&g_mu);
     for (ss_entry_t *e = g_ss_list; e; e=e->next) {
-        if (e->ss_id==chosen_ssid) { data_port = e->ss_data_port; break; }
+        if (e->ss_id==chosen_ssid) { data_port = e->ss_data_port; snprintf(ss_addr, sizeof(ss_addr), "%s", e->ss_addr); break; }
     }
     pthread_mutex_unlock(&g_mu);
     if (data_port==0) return -1;
     if (out_ssid) *out_ssid = chosen_ssid;
     if (out_data_port) *out_data_port = data_port;
+    if (out_addr && addr_sz > 0) snprintf(out_addr, addr_sz, "%s", ss_addr);
     return 0;
 }
 
@@ -218,8 +226,15 @@ static void *client_thread(void *arg) {
             json_get_int_field(buf, "ssId", &ssId);
             json_get_int_field(buf, "ssCtrlPort", &ctrl);
             json_get_int_field(buf, "ssDataPort", &data);
-            add_ss(ssId, ctrl, data);
-            printf("[NM] Registered SS id=%d ctrl=%d data=%d\n", ssId, ctrl, data);
+            // Get client IP from socket
+            struct sockaddr_in peer_addr;
+            socklen_t peer_len = sizeof(peer_addr);
+            char ss_ip[64] = "127.0.0.1";
+            if (getpeername(fd, (struct sockaddr*)&peer_addr, &peer_len) == 0) {
+                inet_ntop(AF_INET, &peer_addr.sin_addr, ss_ip, sizeof(ss_ip));
+            }
+            add_ss(ssId, ctrl, data, ss_ip);
+            printf("[NM] Registered SS id=%d ctrl=%d data=%d addr=%s\n", ssId, ctrl, data, ss_ip);
             const char *resp = "{\"status\":\"OK\"}";
             send_msg(fd, resp, (uint32_t)strlen(resp));
         } else if (strcmp(type, "SS_HEARTBEAT") == 0) {
@@ -228,7 +243,9 @@ static void *client_thread(void *arg) {
             ss_entry_t *e = find_ss_nolock(ssId);
             if (!e) {
                 // Unknown server; add with unknown ports (will not be considered UP until it REGISTERs with ports)
-                e = (ss_entry_t *)malloc(sizeof(ss_entry_t)); memset(e,0,sizeof(*e)); e->ss_id=ssId; e->ss_ctrl_port=0; e->ss_data_port=0; e->next=g_ss_list; g_ss_list=e;
+                struct sockaddr_in peer_addr; socklen_t peer_len = sizeof(peer_addr); char ss_ip[64] = "127.0.0.1";
+                if (getpeername(fd, (struct sockaddr*)&peer_addr, &peer_len) == 0) { inet_ntop(AF_INET, &peer_addr.sin_addr, ss_ip, sizeof(ss_ip)); }
+                e = (ss_entry_t *)malloc(sizeof(ss_entry_t)); memset(e,0,sizeof(*e)); e->ss_id=ssId; e->ss_ctrl_port=0; e->ss_data_port=0; snprintf(e->ss_addr, sizeof(e->ss_addr), "%s", ss_ip); e->next=g_ss_list; g_ss_list=e;
             }
             int was_up = e->is_up;
             e->last_heartbeat = time(NULL);
@@ -271,12 +288,13 @@ static void *client_thread(void *arg) {
                 if (nm_state_find_dir(file, &ssid) != 0) {
                     if (strcmp(op, "WRITE") == 0) {
                         // Auto-provision mapping on first WRITE
-                        int data_port = 0; int chosen_ssid = 0; (void)pick_least_loaded_ss(&chosen_ssid, &data_port);
+                        int data_port = 0; int chosen_ssid = 0; char ss_addr[64];
+                        (void)pick_least_loaded_ss(&chosen_ssid, &data_port, ss_addr, sizeof(ss_addr));
                         fprintf(stderr, "[NM] LOOKUP WRITE auto-provision chosen_ssid=%d data_port=%d\n", chosen_ssid, data_port);
                         if (data_port == 0) {
                             const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
                         } else {
-                            int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                            int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                             if (sfd >= 0) {
                                 char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "CREATE", 1); json_put_string_field(req, sizeof(req), "file", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
@@ -314,8 +332,10 @@ static void *client_thread(void *arg) {
                             // After creation attempt, build ticket
                             int ssid_created=0; if (nm_state_find_dir(file, &ssid_created)==0) {
                                 char ticket2[256]; if (ticket_build(file, op, ssid_created, 600, ticket2, sizeof(ticket2))==0) {
-                                    int dport2=0; pthread_mutex_lock(&g_mu); for(ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid_created){ dport2=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
-                                    if (dport2){ char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", "127.0.0.1", dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2)); }
+                                    int dport2=0; char ss_addr2[64];
+                                    if (get_ss_info(ssid_created, &dport2, ss_addr2, sizeof(ss_addr2)) == 0 && dport2) {
+                                        char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", ss_addr2, dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2));
+                                    }
                                     else { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                 } else { const char *er="{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                             } else { const char *er="{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -338,7 +358,10 @@ static void *client_thread(void *arg) {
                         (void)nm_state_save("nm_state.json");
                         
                         char ticket2[256]; if (ticket_build(file, op, ssid, 600, ticket2, sizeof(ticket2)) != 0) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
-                        else { int dport2=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ dport2=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu); if (dport2){ char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", "127.0.0.1", dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2)); } else { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } }
+                        else { int dport2=0; char ss_addr2[64];
+                            if (get_ss_info(ssid, &dport2, ss_addr2, sizeof(ss_addr2)) == 0 && dport2) {
+                                char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", ss_addr2, dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2));
+                            } else { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } }
                     }
                 }
             }
@@ -354,9 +377,10 @@ static void *client_thread(void *arg) {
                 if (nm_state_find_dir(file, NULL) == 0) { const char *er = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 else {
                     // pick least loaded SS
-                    int chosen_ssid=0, data_port=0; if (pick_least_loaded_ss(&chosen_ssid, &data_port)!=0 || data_port==0) { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                    int chosen_ssid=0, data_port=0; char ss_addr[64];
+                    if (pick_least_loaded_ss(&chosen_ssid, &data_port, ss_addr, sizeof(ss_addr))!=0 || data_port==0) { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                     else {
-                        int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                        int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                         if (sfd < 0) { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                         else {
                             char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "CREATE", 1); json_put_string_field(req, sizeof(req), "file", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
@@ -408,15 +432,15 @@ static void *client_thread(void *arg) {
                 else {
                     char owner[128]; owner[0]='\0'; if (nm_acl_get_owner(file, owner, sizeof(owner)) != 0 || strcmp(owner, user) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                     else {
-                        int data_port = 0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if (e->ss_id==ssid) { data_port = e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
-                        if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        int data_port = 0; char ss_addr[64];
+                        if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                         else {
                             // Build trashed path: .trash/<epoch>_<escaped_original>
                             time_t now = time(NULL);
                             char esc[200]; size_t k=0; for (const char *p=file; *p && k<sizeof(esc)-1; ++p) { esc[k++] = (*p=='/'? '_': *p); } esc[k]='\0';
                             char tpath[256]; snprintf(tpath, sizeof(tpath), ".trash/%ld_%s", (long)now, esc);
                             // Issue RENAME on SS
-                            int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                            int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                             if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                             else {
                                 char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "RENAME", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "newFile", tpath, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
@@ -457,16 +481,9 @@ static void *client_thread(void *arg) {
                     if (nm_acl_check(file, user, "WRITE") != 0) {
                         const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
                     } else {
-                        // resolve data ports
-                        int src_port=0, dst_port=0;
-                        pthread_mutex_lock(&g_mu);
-                        for (ss_entry_t *e=g_ss_list; e; e=e->next){
-                            if(e->ss_id==src_ssid && src_port==0) src_port=e->ss_data_port;
-                            if(e->ss_id==target && dst_port==0) dst_port=e->ss_data_port;
-                            if (src_port && dst_port) break;
-                        }
-                        pthread_mutex_unlock(&g_mu);
-                        if (src_port==0 || dst_port==0) {
+                        // resolve data ports and addresses
+                        int src_port=0, dst_port=0; char src_addr[64], dst_addr[64];
+                        if (get_ss_info(src_ssid, &src_port, src_addr, sizeof(src_addr)) != 0 || get_ss_info(target, &dst_port, dst_addr, sizeof(dst_addr)) != 0 || src_port==0 || dst_port==0) {
                             fprintf(stderr, "[NM] MIGRATE resolve failed: src_port=%d dst_port=%d\n", src_port, dst_port);
                             const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
                         } else {
@@ -475,7 +492,7 @@ static void *client_thread(void *arg) {
                             if (ticket_build(file, "READ", src_ssid, 600, ticket, sizeof(ticket)) != 0) {
                                 const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                             } else {
-                                int sfd = tcp_connect("127.0.0.1", (uint16_t)src_port);
+                                int sfd = tcp_connect(src_addr, (uint16_t)src_port);
                                 if (sfd < 0) {
                                     fprintf(stderr, "[NM] MIGRATE connect to src failed: port=%d\n", src_port);
                                     const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
@@ -503,7 +520,7 @@ static void *client_thread(void *arg) {
                                             } else {
                                                 free(r); close(sfd);
                                                 // PUT to destination
-                                                int dfd = tcp_connect("127.0.0.1", (uint16_t)dst_port);
+                                                int dfd = tcp_connect(dst_addr, (uint16_t)dst_port);
                                                 if (dfd < 0) {
                                                     fprintf(stderr, "[NM] MIGRATE connect to dst failed: port=%d\n", dst_port);
                                                     const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er));
@@ -525,7 +542,7 @@ static void *client_thread(void *arg) {
                                                         } else {
                                                             free(r2); close(dfd);
                                                             // Delete from source (best-effort)
-                                                            int sfd2 = tcp_connect("127.0.0.1", (uint16_t)src_port);
+                                                            int sfd2 = tcp_connect(src_addr, (uint16_t)src_port);
                                                             if (sfd2 >= 0) {
                                                                 char dreq[256]; dreq[0]='\0';
                                                                 json_put_string_field(dreq, sizeof(dreq), "type", "DELETE", 1);
@@ -564,13 +581,11 @@ static void *client_thread(void *arg) {
                         int exists = (nm_state_find_dir(nfile, NULL) == 0);
                         if (exists) { const char *resp = "{\"status\":\"ERR_CONFLICT\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                         else {
-                            // find SS data port
-                            pthread_mutex_lock(&g_mu);
-                            ss_entry_t *e = g_ss_list; int data_port = 0; while (e) { if (e->ss_id == ssid) { data_port = e->ss_data_port; break; } e = e->next; }
-                            pthread_mutex_unlock(&g_mu);
-                            if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                            // find SS data port and address
+                            int data_port = 0; char ss_addr[64];
+                            if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                             else {
-                                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                                int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                                 if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                                 else {
                                     char req[512]; req[0] = '\0';
@@ -621,8 +636,14 @@ static void *client_thread(void *arg) {
                     for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->is_up) { data_port = e->ss_data_port; break; } }
                 }
                 pthread_mutex_unlock(&g_mu);
+                char ss_addr[64] = "127.0.0.1";
                 if (data_port != 0) {
-                    int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                    pthread_mutex_lock(&g_mu);
+                    for (ss_entry_t *e = g_ss_list; e; e = e->next) {
+                        if (e->ss_data_port == data_port) { snprintf(ss_addr, sizeof(ss_addr), "%s", e->ss_addr); break; }
+                    }
+                    pthread_mutex_unlock(&g_mu);
+                    int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                     if (sfd >= 0) {
                         char req[512]; req[0]='\0';
                         json_put_string_field(req, sizeof(req), "type", "CREATEFOLDER", 1);
@@ -725,12 +746,10 @@ static void *client_thread(void *arg) {
                     int ssid = 0;
                     if (nm_state_find_dir(src, &ssid) == 0) {
                         // File move: reuse RENAME path
-                        pthread_mutex_lock(&g_mu);
-                        ss_entry_t *e = g_ss_list; int data_port = 0; while (e) { if (e->ss_id == ssid) { data_port = e->ss_data_port; break; } e = e->next; }
-                        pthread_mutex_unlock(&g_mu);
-                        if (data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
+                        int data_port = 0; char ss_addr[64];
+                        if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port == 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                         else {
-                            int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                            int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                             if (sfd < 0) { const char *resp = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
                             else {
                                 char req[512]; req[0]='\0';
@@ -757,12 +776,9 @@ static void *client_thread(void *arg) {
                         else {
                             int failures = 0;
                             for (int i=0; i<n; ++i) {
-                                int data_port = 0;
-                                pthread_mutex_lock(&g_mu);
-                                for (ss_entry_t *e = g_ss_list; e; e = e->next) { if (e->ss_id == ssids[i]) { data_port = e->ss_data_port; break; } }
-                                pthread_mutex_unlock(&g_mu);
-                                if (data_port == 0) { failures++; continue; }
-                                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                                int data_port = 0; char ss_addr[64];
+                                if (get_ss_info(ssids[i], &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port == 0) { failures++; continue; }
+                                int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                                 if (sfd < 0) { failures++; continue; }
                                 char req[512]; req[0]='\0';
                                 json_put_string_field(req, sizeof(req), "type", "RENAME", 1);
@@ -947,10 +963,10 @@ static void *client_thread(void *arg) {
                 else if (owner[0] && strcmp(owner, user) != 0) { const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 else {
                     // RENAME back on SS
-                    int data_port=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if (e->ss_id==ssid){ data_port=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
-                    if (data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                    int data_port=0; char ss_addr[64];
+                    if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                     else {
-                        int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                        int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                         if (sfd < 0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                         else {
                             char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "RENAME", 1); json_put_string_field(req, sizeof(req), "file", tpath, 0); json_put_string_field(req, sizeof(req), "newFile", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
@@ -989,9 +1005,9 @@ static void *client_thread(void *arg) {
                 if (has_file) { if (strcmp(files[i], target) != 0) continue; }
                 else { if (owners[i][0] && strcmp(owners[i], user) != 0) continue; }
                 // Delete on SS
-                int data_port=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if (e->ss_id==ssids[i]) { data_port=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
-                if (data_port==0) continue;
-                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) continue;
+                int data_port=0; char ss_addr[64];
+                if (get_ss_info(ssids[i], &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port==0) continue;
+                int sfd = tcp_connect(ss_addr, (uint16_t)data_port); if (sfd < 0) continue;
                 char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "DELETE", 1); json_put_string_field(req, sizeof(req), "file", trashed[i], 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) { char *r=NULL; uint32_t rl=0; (void)recv_msg(sfd, &r, &rl); if (r) free(r); }
                 close(sfd);
@@ -1042,16 +1058,14 @@ static void *client_thread(void *arg) {
                     if (!all && !(can_r || can_w)) continue;
                     int size=0, words=0, chars=0, mtime=0, atime=0;
             if (can_r || can_w) {
-                        // resolve ss data port
-                        int data_port=0; pthread_mutex_lock(&g_mu);
-                        for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ data_port=e->ss_data_port; break; } }
-                        pthread_mutex_unlock(&g_mu);
-                        if (data_port!=0) {
+                        // resolve ss data port and address
+                        int data_port=0; char ss_addr[64];
+                        if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) == 0 && data_port!=0) {
                 // Build READ ticket if allowed, else WRITE ticket
                 char ticket[256]; const char *op = can_r ? "READ" : "WRITE";
                 if (ticket_build(f, op, ssid, 600, ticket, sizeof(ticket)) == 0) {
                                 // Query SS INFO
-                                int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port);
+                                int sfd = tcp_connect(ss_addr, (uint16_t)data_port);
                                 if (sfd >= 0) {
                                     char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "INFO", 1);
                                     json_put_string_field(req, sizeof(req), "file", f, 0);
@@ -1097,12 +1111,12 @@ static void *client_thread(void *arg) {
                 int ssid=0; if (nm_state_find_dir(file, &ssid) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 else if (nm_acl_check(file, user, "READ") != 0) { const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 else {
-                    int data_port=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ data_port=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
-                    if (data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                    int data_port=0; char ss_addr[64];
+                    if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                     else {
                         char ticket[256]; if (ticket_build(file, "READ", ssid, 600, ticket, sizeof(ticket)) != 0) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                         else {
-                            int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                            int sfd = tcp_connect(ss_addr, (uint16_t)data_port); if (sfd < 0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                             else {
                                 char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "INFO", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -1138,12 +1152,12 @@ static void *client_thread(void *arg) {
                 int ssid=0; if (nm_state_find_dir(file, &ssid) != 0) { const char *er = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 else if (nm_acl_check(file, user, "READ") != 0) { const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                 else {
-                    int data_port=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ data_port=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu);
-                    if (data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                    int data_port=0; char ss_addr[64];
+                    if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port==0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                     else {
                         char ticket[256]; if (ticket_build(file, "READ", ssid, 600, ticket, sizeof(ticket)) != 0) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                         else {
-                            int sfd = tcp_connect("127.0.0.1", (uint16_t)data_port); if (sfd < 0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+                            int sfd = tcp_connect(ss_addr, (uint16_t)data_port); if (sfd < 0) { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                             else {
                                 char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "READ", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }

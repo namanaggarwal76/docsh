@@ -15,6 +15,8 @@ make -s all
 
 ## Run (one NM, two SS)
 
+### Single machine (localhost):
+
 ```bash
 # Terminal 1: Name Manager (NM)
 ./bin/nm 5000
@@ -24,13 +26,42 @@ make -s all
 
 # Terminal 3: Storage Server #2 (id=2)
 ./bin/ss 127.0.0.1 5000 6003 6004 2
-```
 
-Then start a client shell (you’ll be prompted for username):
-
-```bash
+# Terminal 4: Client
 ./bin/client 127.0.0.1 5000
 ```
+
+### Multiple devices (network):
+
+**On the NM machine (e.g., IP 192.168.1.10):**
+```bash
+./bin/nm 5000
+```
+
+**On Storage Server machine 1 (any IP):**
+```bash
+# Use NM's IP address
+./bin/ss 192.168.1.10 5000 6001 6002 1
+```
+
+**On Storage Server machine 2 (any IP):**
+```bash
+# Use NM's IP address
+./bin/ss 192.168.1.10 5000 6003 6004 2
+```
+
+**On any client machine:**
+```bash
+# Connect to NM's IP address
+./bin/client 192.168.1.10 5000
+```
+
+**Notes:**
+- Storage Servers automatically register their IP address with the NM (extracted from the TCP connection)
+- Clients connect to the NM to get storage server addresses dynamically
+- No hardcoded localhost - the system works across networks
+- Ensure firewall rules allow TCP connections on the specified ports
+- The NM must be reachable from all SS and client machines
 
 ## Final feature set (CLI)
 
