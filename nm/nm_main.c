@@ -598,8 +598,8 @@ static void *client_thread(void *arg) {
                                             if (strstr(r, "\"status\":\"OK\"")) {
                                                 nm_dir_rename(file, nfile);
                                                 nm_acl_rename(file, nfile);
-                                                // replicate rename to replicas
-                                                int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                                                // replicate rename to replicas (lookup after rename using new key)
+                                                int repls[16]; size_t nr = nm_state_get_replicas(nfile, repls, 16);
                                                 for (size_t i=0;i<nr;i++) schedule_cmd_repl("RENAME", file, nfile, repls[i]);
                                                 (void)nm_state_save("nm_state.json");
                                                 const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
@@ -759,7 +759,11 @@ static void *client_thread(void *arg) {
                                 strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
                                     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                        // Capture replicas of source before state changes
+                                        int repls[16]; size_t nr = nm_state_get_replicas(src, repls, 16);
                                         nm_dir_rename(src, final_dst); nm_acl_rename(src, final_dst);
+                                        // Replicate rename to replicas
+                                        for (size_t i=0;i<nr;i++) schedule_cmd_repl("RENAME", src, final_dst, repls[i]);
                                         (void)nm_state_save("nm_state.json");
                                         const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                     } else { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
@@ -787,7 +791,12 @@ static void *client_thread(void *arg) {
                                 strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); failures++; continue; }
                                 char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { failures++; }
-                                else { nm_acl_rename(files[i], new_files[i]); }
+                                else {
+                                    // Replicate this file rename to its replicas
+                                    int repls[16]; size_t nr = nm_state_get_replicas(files[i], repls, 16);
+                                    nm_acl_rename(files[i], new_files[i]);
+                                    for (size_t j=0;j<nr;j++) schedule_cmd_repl("RENAME", files[i], new_files[i], repls[j]);
+                                }
                                 free(r); close(sfd);
                             }
                             if (failures) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, resp, (uint32_t)strlen(resp)); }
