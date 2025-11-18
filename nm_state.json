@@ -1,9 +1,9 @@
 {
-  "users":["naman"],
-  "active":["naman"],
-  "directory":{"hello.txt":{"ss_id":2,"last_modified_user":"naman","last_modified_time":1763479384,"last_accessed_user":"naman","last_accessed_time":1763481079}},
-  "acls":{"hello.txt":{"owner":"naman","grants":{"naman":"RW"}}},
-  "replicas":{"hello.txt":[1]},
+  "users":["naman","manav"],
+  "active":[],
+  "directory":{"hello.txt":{"ss_id":1,"last_modified_user":null,"last_modified_time":0,"last_accessed_user":null,"last_accessed_time":0},"last_modified_user":{"ss_id":0,"last_modified_user":null,"last_modified_time":0,"last_accessed_user":null,"last_accessed_time":0},"last_modified_time":{"ss_id":1763479384,"last_modified_user":null,"last_modified_time":0,"last_accessed_user":null,"last_accessed_time":0},"last_accessed_user":{"ss_id":0,"last_modified_user":null,"last_modified_time":0,"last_accessed_user":null,"last_accessed_time":0},"last_accessed_time":{"ss_id":1763481079,"last_modified_user":null,"last_modified_time":0,"last_accessed_user":null,"last_accessed_time":0},"f1.txt":{"ss_id":1,"last_modified_user":"manav","last_modified_time":1763482580,"last_accessed_user":"naman","last_accessed_time":1763482630}},
+  "acls":{"hello.txt":{"owner":"owner","grants":{"naman":"RW"}},"f1.txt":{"owner":"manav","grants":{"manav":"RW","anonymous":"RW"}}},
+  "replicas":{"hello.txt":[0],"last_modified_user":[],"last_modified_time":[],"last_accessed_user":[],"last_accessed_time":[],"f1.txt":[]},
   "requests":{},
   "folders":[],
   "trash":[]
