@@ -445,6 +445,12 @@ static void *ss_conn_handler(void *varg) {
                                 // Consume the undo snapshot after successful restore
                                 unlink(undopath);
                                 const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
+                                // Notify NM about commit for replication
+                                int nfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
+                                if (nfd >= 0) {
+                                    char note[256]; note[0]='\0'; json_put_string_field(note, sizeof(note), "type", "SS_COMMIT", 1); json_put_string_field(note, sizeof(note), "file", file, 0); json_put_int_field(note, sizeof(note), "ssId", g_ss_id, 0); strncat(note, "}", sizeof(note)-strlen(note)-1);
+                                    (void)send_msg(nfd, note, (uint32_t)strlen(note)); char *nr=NULL; uint32_t nrl=0; (void)recv_msg(nfd, &nr, &nrl); if (nr) free(nr); close(nfd);
+                                }
                             }
                         }
                     }
@@ -467,7 +473,14 @@ static void *ss_conn_handler(void *varg) {
                         char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
                         if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.rvtmp", path); else { char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755); snprintf(tmppath, sizeof(tmppath), "%s", mp); strncat(tmppath, "/revert.tmp", sizeof(tmppath)-strlen(tmppath)-1);} 
                         FILE *f = fopen(tmppath, "wb"); if (!f) { free(snap); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                        else { fwrite(snap, 1, slen, f); fflush(f); fclose(f); free(snap); if (rename(tmppath, path)!=0) { perror("[SS] revert rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } }
+                        else { fwrite(snap, 1, slen, f); fflush(f); fclose(f); free(snap); if (rename(tmppath, path)!=0) { perror("[SS] revert rename"); unlink(tmppath); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); } else { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); 
+                                // Notify NM about commit for replication
+                                int nfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
+                                if (nfd >= 0) {
+                                    char note[256]; note[0]='\0'; json_put_string_field(note, sizeof(note), "type", "SS_COMMIT", 1); json_put_string_field(note, sizeof(note), "file", file, 0); json_put_int_field(note, sizeof(note), "ssId", g_ss_id, 0); strncat(note, "}", sizeof(note)-strlen(note)-1);
+                                    (void)send_msg(nfd, note, (uint32_t)strlen(note)); char *nr=NULL; uint32_t nrl=0; (void)recv_msg(nfd, &nr, &nrl); if (nr) free(nr); close(nfd);
+                                }
+                            } }
                     }
                 }
             } else if (strcmp(type, "CHECKPOINT") == 0) {

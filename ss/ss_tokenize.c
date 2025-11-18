@@ -190,23 +190,26 @@ int ss_tokens_replace_or_append(ss_doc_tokens_t *doc, int sidx, int widx, const 
         row[wc - 1] = nw;
         return 0;
     }
-    // Determine insertion index with punctuation-aware semantics
+    // Determine insertion index
     int ins_idx = widx;
     if (widx > wc) {
-        // allow wc+1 only if last token ends with sentence delimiter
-        if (!(wc > 0)) return -1;
+        // Only allow appending at wc, not beyond
+        return -1;
+    }
+    
+    // Check if we're appending and last word has sentence delimiter
+    int move_delimiter = 0;
+    char delimiter = '\0';
+    if (widx == wc && wc > 0) {
         char **row = doc->sent_words[sidx];
-        char *last = row[wc - 1]; size_t ln = strlen(last);
-        if (ln == 0 || !is_sentence_end(last[ln-1]) || widx != wc + 1) return -1;
-        ins_idx = wc - 1; // insert before last token
-    } else if (widx == wc) {
-        // If last token ends with delimiter and we're inserting words (not bare delimiter), insert before last
-        if (wc > 0) {
-            char **row = doc->sent_words[sidx];
-            char *last = row[wc - 1]; size_t ln = strlen(last);
-            if (ln > 0 && is_sentence_end(last[ln-1])) {
-                ins_idx = wc - 1; // before last, to keep punctuation at end
-            }
+        char *last = row[wc - 1];
+        size_t ln = strlen(last);
+        if (ln > 0 && is_sentence_end(last[ln-1])) {
+            // We'll remove delimiter from last word and add it to the new word(s)
+            move_delimiter = 1;
+            delimiter = last[ln-1];
+            // Remove delimiter from last word
+            last[ln-1] = '\0';
         }
     }
 
@@ -223,6 +226,17 @@ int ss_tokens_replace_or_append(ss_doc_tokens_t *doc, int sidx, int widx, const 
         char *dup = str_dup_range(start, n);
         if (!dup) { for (int i=0;i<k;i++) free(ins[i]); free(ins); return -1; }
         ins[k++] = dup;
+    }
+    
+    // If we moved a delimiter, add it to the last inserted token
+    if (move_delimiter && ntok > 0) {
+        char *last_ins = ins[ntok - 1];
+        size_t ln = strlen(last_ins);
+        char *with_delim = (char *)realloc(last_ins, ln + 2);
+        if (!with_delim) { for (int i=0;i<ntok;i++) free(ins[i]); free(ins); return -1; }
+        with_delim[ln] = delimiter;
+        with_delim[ln+1] = '\0';
+        ins[ntok - 1] = with_delim;
     }
 
     // Allocate new row with spliced tokens

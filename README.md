@@ -46,9 +46,9 @@ Then start a client shell (you’ll be prompted for username):
 - EMPTYTRASH [<file>]
 - STREAM <file>
 - LIST (active users)
-- ADDACCESS -R|-W <file> <user>
+- ADDACCESS -r|-w <file> <user>
 - REMACCESS <file> <user>
-- REQUEST_ACCESS <file> [-R|-W]
+- REQUEST_ACCESS <file> [-r|-w]
 - VIEWREQUESTS <file>
 - EXEC <file>
 - CREATEFOLDER <path>
@@ -97,9 +97,9 @@ READ demo.txt
 
 3) Access control
 ```bash
-ADDACCESS -R demo.txt bob
+ADDACCESS -r demo.txt bob
 REMACCESS demo.txt bob
-REQUEST_ACCESS demo.txt -R  # as a non-owner
+REQUEST_ACCESS demo.txt -r  # as a non-owner
 VIEWREQUESTS demo.txt       # as owner
 ```
 

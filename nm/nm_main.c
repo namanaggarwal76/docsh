@@ -283,6 +283,11 @@ static void *client_thread(void *arg) {
                                     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
                                         nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
                                         
+                                        // Initialize metadata: set creator and creation time
+                                        int now = (int)time(NULL);
+                                        nm_state_set_file_modified(file, user, now);
+                                        nm_state_set_file_accessed(file, user, now);
+                                        
                                         // Set up replicas for auto-provisioned file
                                         int replicas[16]; size_t nr = 0;
                                         pthread_mutex_lock(&g_mu);
@@ -360,6 +365,11 @@ static void *client_thread(void *arg) {
                                 char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
                                     nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
                                     if (pubR || pubW) { int anonPerm=0; if (pubR) anonPerm |= ACL_R; if (pubW) anonPerm |= (ACL_R|ACL_W); if (anonPerm) nm_acl_grant(file, "anonymous", anonPerm); }
+                                    
+                                    // Initialize metadata: set creator and creation time
+                                    int now = (int)time(NULL);
+                                    nm_state_set_file_modified(file, user, now);
+                                    nm_state_set_file_accessed(file, user, now);
                                     
                                     // Set up replicas: pick other available SS as replica (1 replica only)
                                     int replicas[16]; size_t nr = 0;
@@ -861,13 +871,35 @@ static void *client_thread(void *arg) {
             pthread_mutex_unlock(&g_mu);
             send_msg(fd, resp, (uint32_t)strlen(resp));
     } else if (strcmp(type, "LIST_USERS") == 0) {
-            // Return only active users (logged-in)
-            char users[256][128]; size_t n = nm_state_get_active_users(users, 256);
-            char resp[4096]; size_t w = 0; w += snprintf(resp + w, sizeof(resp) - w, "{\"status\":\"OK\",\"users\":[");
-            for (size_t i = 0; i < n; ++i) {
+            // Return all users with their active status
+            char all_users[256][128]; size_t n_all = nm_state_get_users(all_users, 256);
+            char active_users[256][128]; size_t n_active = nm_state_get_active_users(active_users, 256);
+            
+            char resp[8192]; size_t w = 0; 
+            w += snprintf(resp + w, sizeof(resp) - w, "{\"status\":\"OK\",\"active\":[");
+            for (size_t i = 0; i < n_active; ++i) {
                 if (i) w += snprintf(resp + w, sizeof(resp) - w, ",");
-                w += snprintf(resp + w, sizeof(resp) - w, "\"%s\"", users[i]);
+                w += snprintf(resp + w, sizeof(resp) - w, "\"%s\"", active_users[i]);
             }
+            w += snprintf(resp + w, sizeof(resp) - w, "],\"inactive\":[");
+            
+            int first_inactive = 1;
+            for (size_t i = 0; i < n_all; ++i) {
+                // Check if this user is active
+                int is_active = 0;
+                for (size_t j = 0; j < n_active; ++j) {
+                    if (strcmp(all_users[i], active_users[j]) == 0) {
+                        is_active = 1;
+                        break;
+                    }
+                }
+                if (!is_active) {
+                    if (!first_inactive) w += snprintf(resp + w, sizeof(resp) - w, ",");
+                    w += snprintf(resp + w, sizeof(resp) - w, "\"%s\"", all_users[i]);
+                    first_inactive = 0;
+                }
+            }
+            
             if (w < sizeof(resp)) w += snprintf(resp + w, sizeof(resp) - w, "]}");
             send_msg(fd, resp, (uint32_t)strlen(resp));
         } else if (strcmp(type, "APPROVE_ACCESS") == 0) {
@@ -932,6 +964,11 @@ static void *client_thread(void *arg) {
                                     nm_state_trash_remove(file);
                                     nm_dir_set(file, ssid);
                                     if (owner[0]) { nm_acl_set_owner(file, owner); nm_acl_grant(file, owner, ACL_R|ACL_W); }
+                                    
+                                    // Schedule replication of RENAME to replicas
+                                    int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                                    for (size_t i=0;i<nr;i++) schedule_cmd_repl("RENAME", tpath, file, repls[i]);
+                                    
                                     (void)nm_state_save("nm_state.json");
                                     const char *ok = "{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                 }
@@ -958,6 +995,11 @@ static void *client_thread(void *arg) {
                 char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "DELETE", 1); json_put_string_field(req, sizeof(req), "file", trashed[i], 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) { char *r=NULL; uint32_t rl=0; (void)recv_msg(sfd, &r, &rl); if (r) free(r); }
                 close(sfd);
+                
+                // Schedule DELETE replication to replicas
+                int repls[16]; size_t nr = nm_state_get_replicas(files[i], repls, 16);
+                for (size_t j=0;j<nr;j++) schedule_cmd_repl("DELETE", trashed[i], NULL, repls[j]);
+                
                 nm_state_trash_remove(files[i]); purged++;
             }
             (void)nm_state_save("nm_state.json");
@@ -1142,8 +1184,14 @@ static void *client_thread(void *arg) {
                                                 execl("/bin/sh", "sh", "-s", (char *)NULL);
                                                 _exit(127);
                                             } else {
-                                                // Parent: write script to child's stdin, then read output
+                                                // Parent: write script to child's stdin, then read and stream output
                                                 close(in_pipe[0]); close(out_pipe[1]);
+                                                
+                                                // Send initial OK with stream marker
+                                                const char *start = "{\"status\":\"OK\",\"stream\":\"EXEC\"}";
+                                                send_msg(fd, start, (uint32_t)strlen(start));
+                                                
+                                                // Write script to child's stdin
                                                 size_t bl = strlen(body); size_t off = 0; 
                                                 while (off < bl) {
                                                     ssize_t wn = write(in_pipe[1], body + off, bl - off);
@@ -1154,29 +1202,33 @@ static void *client_thread(void *arg) {
                                                     off += (size_t)wn;
                                                 }
                                                 close(in_pipe[1]);
-                                                char outbuf[8192]; size_t w=0; char tmp[512]; ssize_t nrd;
+                                                
+                                                // Stream output in chunks
+                                                char tmp[512]; ssize_t nrd;
                                                 while ((nrd = read(out_pipe[0], tmp, sizeof(tmp))) > 0) {
-                                                    size_t copy = (size_t)nrd;
-                                                    if (w + copy >= sizeof(outbuf)) copy = sizeof(outbuf) - 1 - w;
-                                                    if (copy > 0) { memcpy(outbuf + w, tmp, copy); w += copy; if (w >= sizeof(outbuf)-1) break; }
+                                                    // Build chunk message with escaped content
+                                                    char chunk[2048]; chunk[0]='\0';
+                                                    strncat(chunk, "{\"status\":\"OK\",\"chunk\":\"", sizeof(chunk)-strlen(chunk)-1);
+                                                    for (ssize_t i=0; i<nrd && strlen(chunk)+4<sizeof(chunk); ++i) {
+                                                        char ch = tmp[i];
+                                                        if (ch=='\\') { strncat(chunk, "\\\\", sizeof(chunk)-strlen(chunk)-1); }
+                                                        else if (ch=='"') { strncat(chunk, "\\\"", sizeof(chunk)-strlen(chunk)-1); }
+                                                        else if (ch=='\n') { strncat(chunk, "\\n", sizeof(chunk)-strlen(chunk)-1); }
+                                                        else if (ch=='\r') { strncat(chunk, "\\r", sizeof(chunk)-strlen(chunk)-1); }
+                                                        else if (ch=='\t') { strncat(chunk, "\\t", sizeof(chunk)-strlen(chunk)-1); }
+                                                        else { char s[2]={ch,0}; strncat(chunk, s, sizeof(chunk)-strlen(chunk)-1); }
+                                                    }
+                                                    strncat(chunk, "\"}", sizeof(chunk)-strlen(chunk)-1);
+                                                    send_msg(fd, chunk, (uint32_t)strlen(chunk));
                                                 }
-                                                if (w < sizeof(outbuf)) outbuf[w] = '\0'; else outbuf[sizeof(outbuf)-1] = '\0';
                                                 close(out_pipe[0]);
+                                                
+                                                // Wait for child and send final STOP message
                                                 int status=0; (void)waitpid(pid, &status, 0);
-                                                // Build JSON response with properly escaped output
-                                                char j[16384]; j[0]='\0'; strncat(j, "{\"status\":\"OK\",\"output\":\"", sizeof(j)-strlen(j)-1);
-                                                size_t wlen = strlen(outbuf);
-                                                for (size_t i=0;i<wlen && strlen(j)+4<sizeof(j);++i){ 
-                                                    char ch=outbuf[i]; 
-                                                    if (ch=='\\') { strncat(j, "\\\\", sizeof(j)-strlen(j)-1); } 
-                                                    else if (ch=='"') { strncat(j, "\\\"", sizeof(j)-strlen(j)-1); } 
-                                                    else if (ch=='\n') { strncat(j, "\\n", sizeof(j)-strlen(j)-1); } 
-                                                    else if (ch=='\r') { strncat(j, "\\r", sizeof(j)-strlen(j)-1); } 
-                                                    else if (ch=='\t') { strncat(j, "\\t", sizeof(j)-strlen(j)-1); } 
-                                                    else { char s[2]={ch,0}; strncat(j,s, sizeof(j)-strlen(j)-1);} 
-                                                }
-                                                strncat(j, "\"}", sizeof(j)-strlen(j)-1);
-                                                send_msg(fd, j, (uint32_t)strlen(j));
+                                                int exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+                                                char stop[128];
+                                                snprintf(stop, sizeof(stop), "{\"status\":\"STOP\",\"exit\":%d}", exit_code);
+                                                send_msg(fd, stop, (uint32_t)strlen(stop));
                                             }
                                         }
                                     }

@@ -31,6 +31,29 @@ static int tokenize(const char *line, char **outv, int maxv){
 }
 static void free_tokens(char **v, int n){ for(int i=0;i<n;i++) free(v[i]); }
 
+// Process escape sequences in a string (e.g., convert "\\n" to actual newline)
+static void unescape_string(char *str) {
+    if (!str) return;
+    char *src = str, *dst = str;
+    while (*src) {
+        if (*src == '\\' && *(src+1)) {
+            src++; // skip backslash
+            switch (*src) {
+                case 'n': *dst++ = '\n'; break;
+                case 't': *dst++ = '\t'; break;
+                case 'r': *dst++ = '\r'; break;
+                case '\\': *dst++ = '\\'; break;
+                case '"': *dst++ = '"'; break;
+                default: *dst++ = *src; break; // keep unknown escapes as-is
+            }
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
 // Simple interactive line editor with history (TTY only)
 typedef struct {
     char *items[200];
@@ -177,8 +200,11 @@ static void print_human(const char *who, const char *json) {
         }
         // VIEWREQUESTS: requests list
         if (strstr(json, "\"requests\":")) {
-            if (color) printf("%sRequests:%s\n", C, Z); else printf("Requests:\n");
+            if (color) printf("%sAccess Requests:%s\n", C, Z); else printf("Access Requests:\n");
             const char *p = strstr(json, "["); if (!p) { printf("(none)\n"); return; }
+            printf("┌────────────────────────┬──────┐\n");
+            printf("│ User                   │ Mode │\n");
+            printf("├────────────────────────┼──────┤\n");
             p++;
             int count = 0;
             while (*p && *p!=']') {
@@ -205,23 +231,32 @@ static void print_human(const char *who, const char *json) {
                         if (*p==',') p++;
                     }
                     if (*p=='}') p++;
-                    printf("- %s (%c)\n", name[0]?name:"?", mode);
+                    printf("│ %-22s │ %-4c │\n", name[0]?name:"?", mode);
                     count++;
                 } else if (*p=='"') {
                     // Backward compat: username string only
                     p++; const char *s=p; while(*p && *p!='"') p++; size_t n=(size_t)(p-s);
                     char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0';
                     if (*p=='"') p++;
-                    printf("- %s (R)\n", name);
+                    printf("│ %-22s │ %-4c │\n", name, 'R');
                     count++;
                 } else break;
             }
-            if (count==0) printf("(none)\n");
+            if (count > 0) {
+                printf("└────────────────────────┴──────┘\n");
+            } else {
+                printf("│ (none)                 │      │\n");
+                printf("└────────────────────────┴──────┘\n");
+            }
             return;
         }
         // LISTTRASH: trashed items
         if (strstr(json, "\"trash\":")) {
             const char *p = strstr(json, "["); if (!p) { printf("%sOK%s\n", G, Z); return; }
+            if (color) printf("%sTrash:%s\n", C, Z); else printf("Trash:\n");
+            printf("┌──────────────┬────────┬───────┬──────────────────┬────────┐\n");
+            printf("│ File         │ Owner  │ SS ID │ Time             │ Status │\n");
+            printf("├──────────────┼────────┼───────┼──────────────────┼────────┤\n");
             p++;
             int count = 0;
             while (*p && *p != ']') {
@@ -235,37 +270,122 @@ static void print_human(const char *who, const char *json) {
                 (void)json_get_int_field(p, "ssid", &ssid);
                 (void)json_get_int_field(p, "when", &when);
                 char tbuf[32]; format_time_hr(when, tbuf, sizeof(tbuf));
-                printf("- %s (owner: %s, ssid: %d, trashed:%s, when: %s)\n", file[0]?file:"?", owner[0]?owner:"-", ssid, trashed[0]?" yes":" no", tbuf);
+                printf("│ %-12s │ %-6s │ %5d │ %16s │ %-6s │\n", 
+                       file[0]?file:"?", owner[0]?owner:"-", ssid, tbuf, 
+                       trashed[0]?"yes":"no");
                 while (*p && *p != '}') p++;
                 if (*p == '}') p++;
                 while (*p && *p!=',' && *p!=']') p++;
                 if (*p == ',') p++;
                 count++;
             }
-            if (count==0) printf("(trash empty)\n");
+            if (count > 0) {
+                printf("└──────────────┴────────┴───────┴──────────────────┴────────┘\n");
+            } else {
+                printf("│ (empty)      │        │       │                  │        │\n");
+                printf("└──────────────┴────────┴───────┴──────────────────┴────────┘\n");
+            }
             return;
         }
-    // LIST_USERS: users list (active users)
-    // Match any users array shape, e.g., "users":[...] with or without spaces
+    // LIST_USERS: users list with active and inactive sections
+    if (strstr(json, "\"active\":[") || strstr(json, "\"inactive\":[")) {
+            // Parse active users
+            const char *p_active = strstr(json, "\"active\":");
+            if (p_active) {
+                p_active = strchr(p_active, '[');
+                if (p_active) {
+                    p_active++;
+                    if (color) printf("%sActive Users:%s\n", C, Z); else printf("Active Users:\n");
+                    printf("┌────────────────────────┐\n");
+                    printf("│ Username               │\n");
+                    printf("├────────────────────────┤\n");
+                    int count = 0;
+                    while (*p_active && *p_active != ']') {
+                        while (*p_active==' '||*p_active=='\n'||*p_active=='\t'||*p_active==',') p_active++;
+                        if (*p_active == '"') {
+                            p_active++; const char *s = p_active; while (*p_active && *p_active != '"') p_active++; 
+                            size_t n = (size_t)(p_active - s);
+                            char name[256]; if (n >= sizeof(name)) n = sizeof(name)-1; memcpy(name, s, n); name[n] = '\0';
+                            printf("│ %-22s │\n", name);
+                            count++;
+                            if (*p_active == '"') p_active++;
+                        } else break;
+                    }
+                    if (count > 0) {
+                        printf("└────────────────────────┘\n");
+                    } else {
+                        printf("│ (no active users)      │\n");
+                        printf("└────────────────────────┘\n");
+                    }
+                }
+            }
+            
+            // Parse inactive users
+            const char *p_inactive = strstr(json, "\"inactive\":");
+            if (p_inactive) {
+                p_inactive = strchr(p_inactive, '[');
+                if (p_inactive) {
+                    p_inactive++;
+                    printf("\n");
+                    if (color) printf("%sInactive Users:%s\n", C, Z); else printf("Inactive Users:\n");
+                    printf("┌────────────────────────┐\n");
+                    printf("│ Username               │\n");
+                    printf("├────────────────────────┤\n");
+                    int count = 0;
+                    while (*p_inactive && *p_inactive != ']') {
+                        while (*p_inactive==' '||*p_inactive=='\n'||*p_inactive=='\t'||*p_inactive==',') p_inactive++;
+                        if (*p_inactive == '"') {
+                            p_inactive++; const char *s = p_inactive; while (*p_inactive && *p_inactive != '"') p_inactive++; 
+                            size_t n = (size_t)(p_inactive - s);
+                            char name[256]; if (n >= sizeof(name)) n = sizeof(name)-1; memcpy(name, s, n); name[n] = '\0';
+                            printf("│ %-22s │\n", name);
+                            count++;
+                            if (*p_inactive == '"') p_inactive++;
+                        } else break;
+                    }
+                    if (count > 0) {
+                        printf("└────────────────────────┘\n");
+                    } else {
+                        printf("│ (no inactive users)    │\n");
+                        printf("└────────────────────────┘\n");
+                    }
+                }
+            }
+            
+            // print final ok as requested
+            if (color) printf("%sok%s\n", G, Z); else printf("ok\n");
+            return;
+        }
+    // Backward compatibility: old "users" array format (active only)
     if (strstr(json, "\"users\":[")) {
             const char *p = strstr(json, "\"users\":");
-            if (!p) { printf("ok\n"); return; }
+            if (!p) { if (color) printf("%sok%s\n", G, Z); else printf("ok\n"); return; }
             p = strchr(p, '[');
-            if (!p) { printf("ok\n"); return; }
+            if (!p) { if (color) printf("%sok%s\n", G, Z); else printf("ok\n"); return; }
             p++;
+            if (color) printf("%sActive Users:%s\n", C, Z); else printf("Active Users:\n");
+            printf("┌────────────────────────┐\n");
+            printf("│ Username               │\n");
+            printf("├────────────────────────┤\n");
             int count = 0;
             while (*p && *p != ']') {
                 while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
                 if (*p == '"') {
                     p++; const char *s = p; while (*p && *p != '"') p++; size_t n = (size_t)(p - s);
                     char name[256]; if (n >= sizeof(name)) n = sizeof(name)-1; memcpy(name, s, n); name[n] = '\0';
-                    printf("%s\n", name);
+                    printf("│ %-22s │\n", name);
                     count++;
                     if (*p == '"') p++;
                 } else break;
             }
+            if (count > 0) {
+                printf("└────────────────────────┘\n");
+            } else {
+                printf("│ (no active users)      │\n");
+                printf("└────────────────────────┘\n");
+            }
             // print final ok as requested
-            printf("ok\n");
+            if (color) printf("%sok%s\n", G, Z); else printf("ok\n");
             return;
         }
         // STATS summary
@@ -289,21 +409,12 @@ static void print_human(const char *who, const char *json) {
                     p++; const char *s=p; while(*p && *p!='"') p++; size_t n=(size_t)(p-s);
                     char name[256]; if (n>=sizeof(name)) n=sizeof(name)-1; memcpy(name,s,n); name[n]='\0';
                     if (*p=='"') p++;
-                    printf("- %s\n", name);
+                    printf("│ %-22s │\n", name);
                     count++;
                 } else break;
             }
             if (count == 0) printf("(no checkpoints)\n");
             return;
-        }
-        // EXEC output
-        {
-            char out[8192];
-            if (json_get_string_field(json, "output", out, sizeof(out)) == 0) {
-                // Output is already unescaped by json_get_string_field, print as-is
-                printf("%s", out);
-                return;
-            }
         }
         // INFO pretty print
         {
@@ -397,7 +508,7 @@ static void print_human(const char *who, const char *json) {
                 return;
             }
             // VIEW basic list
-            const char *p = strstr(json, "["); if (!p) { printf("OK\n"); return; }
+            const char *p = strstr(json, "["); if (!p) { if (color) printf("%sOK%s\n", G, Z); else printf("OK\n"); return; }
             p++;
             while (*p && *p!=']') {
                 while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
@@ -412,9 +523,9 @@ static void print_human(const char *who, const char *json) {
         }
         if (strstr(json, "\"details\":[")) {
             // VIEW -l: print table
-            printf("---------------------------------------------------------\n");
-            printf("|  Filename  | Words | Chars | Last Access Time | Owner |\n");
-            printf("|------------|-------|-------|------------------|-------|\n");
+            printf("┌────────────┬───────┬───────┬──────────────────┬───────┐\n");
+            printf("│  Filename  │ Words │ Chars │ Last Access Time │ Owner │\n");
+            printf("├────────────┼───────┼───────┼──────────────────┼───────┤\n");
             const char *p = strstr(json, "["); if (!p) { printf("---------------------------------------------------------\n"); return; }
             p++;
             while (*p && *p!=']') {
@@ -430,7 +541,7 @@ static void print_human(const char *who, const char *json) {
                 (void)json_get_int_field(p, "atime", &atime);
                 char atime_s[32]; format_time_hr(atime, atime_s, sizeof(atime_s));
                 // print row with human-readable time
-                printf("| %-10s | %5d | %5d | %16s | %-5s |\n", name, words, chars, atime_s, owner[0]?owner:"-");
+                printf("│ %-10s │ %5d │ %5d │ %16s │ %-5s │\n", name, words, chars, atime_s, owner[0]?owner:"-");
                 while (*p && *p!='}') p++;
                 if (*p=='}') p++;
                 while (*p && *p!=',' && *p!=']') p++;
@@ -481,16 +592,34 @@ int main(int argc, char **argv) {
     }
 
     char username[128];
-    fprintf(stdout, "Enter username: "); fflush(stdout);
-    if (!fgets(username, sizeof(username), stdin)) { fprintf(stderr, "Failed to read username\n"); return 1; }
-    rstrip(username);
-    // Say hello once
-    int hfd = tcp_connect(nm_host, nm_port);
-    if (hfd >= 0) {
-        char hello[256]; hello[0]='\0'; json_put_string_field(hello, sizeof(hello), "type", "CLIENT_HELLO", 1); json_put_string_field(hello, sizeof(hello), "user", username, 0); strncat(hello, "}", sizeof(hello)-strlen(hello)-1);
-        (void)send_msg(hfd, hello, (uint32_t)strlen(hello)); char *hr=NULL; uint32_t hrl=0; (void)recv_msg(hfd, &hr, &hrl); free(hr); close(hfd);
-    } else {
-        fprintf(stderr, "[CLI] Could not connect to NM at %s:%u (will try per command)\n", nm_host, (unsigned)nm_port);
+    for (;;) {
+        fprintf(stdout, "Enter username: "); fflush(stdout);
+        if (!fgets(username, sizeof(username), stdin)) { fprintf(stderr, "Failed to read username\n"); return 1; }
+        rstrip(username);
+        if (!username[0]) continue; // Empty username, try again
+        
+        // Say hello once
+        int hfd = tcp_connect(nm_host, nm_port);
+        if (hfd >= 0) {
+            char hello[256]; hello[0]='\0'; json_put_string_field(hello, sizeof(hello), "type", "CLIENT_HELLO", 1); json_put_string_field(hello, sizeof(hello), "user", username, 0); strncat(hello, "}", sizeof(hello)-strlen(hello)-1);
+            (void)send_msg(hfd, hello, (uint32_t)strlen(hello)); 
+            char *hr=NULL; uint32_t hrl=0; 
+            if (recv_msg(hfd, &hr, &hrl) == 0 && hr) {
+                char status[32] = {0};
+                json_get_string_field(hr, "status", status, sizeof(status));
+                if (strcmp(status, "ERR_CONFLICT") == 0) {
+                    fprintf(stderr, "ERROR: User already exists. Create new.\n");
+                    free(hr); close(hfd);
+                    continue; // Ask for username again
+                }
+                free(hr);
+            }
+            close(hfd);
+            break; // Successfully registered
+        } else {
+            fprintf(stderr, "[CLI] Could not connect to NM at %s:%u (will try per command)\n", nm_host, (unsigned)nm_port);
+            break; // Proceed even if can't connect
+        }
     }
     printf("Welcome to Docs++ shell. Connected to %s:%u as %s. Type 'help' or 'exit'.\n", nm_host, (unsigned)nm_port, username);
     char line[2048];
@@ -521,9 +650,9 @@ int main(int argc, char **argv) {
             printf("  EMPTYTRASH [<file>]\n");
             printf("  STREAM <file>\n");
             printf("  LIST\n");
-            printf("  ADDACCESS -R|-W <file> <user>\n");
+            printf("  ADDACCESS -r|-w <file> <user>\n");
             printf("  REMACCESS <file> <user>\n");
-            printf("  REQUEST_ACCESS <file> [-R|-W]\n");
+            printf("  REQUEST_ACCESS <file> [-r|-w]\n");
             printf("  VIEWREQUESTS <file>\n");
             printf("  EXEC <file>\n");
             printf("  CREATEFOLDER <path>\n");
@@ -662,6 +791,9 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp = NULL; uint32_t rlen = 0;
     if (recv_msg(fd, &resp, &rlen) < 0) { fprintf(stderr, "ERROR: failed to receive LOOKUP from NM\n"); close(fd); return 1; }
+        // Check status first
+        char st[32]={0}; (void)json_get_string_field(resp, "status", st, sizeof(st));
+        if (st[0] && strcmp(st, "OK") != 0) { print_human("NM", resp); free(resp); close(fd); return 1; }
         // Parse ssDataPort
     int dport = 0; char ssaddr[64] = {0}; char ticket[256] = {0};
     int ok = (json_get_int_field(resp, "ssDataPort", &dport) == 0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr)) == 0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket)) == 0);
@@ -692,6 +824,9 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         strncat(payload, "}", sizeof(payload)-strlen(payload)-1);
         if (send_msg(fd, payload, (uint32_t)strlen(payload)) < 0) { perror("send"); close(fd); return 1; }
         char *resp=NULL; uint32_t rlen=0; if (recv_msg(fd, &resp, &rlen) < 0) { perror("recv"); close(fd); return 1; }
+        // Check status first
+        char st[32]={0}; (void)json_get_string_field(resp, "status", st, sizeof(st));
+        if (st[0] && strcmp(st, "OK") != 0) { print_human("NM", resp); free(resp); close(fd); return 1; }
     int dport=0; char ssaddr[64]={0}; char ticket[256]={0}; int ok = (json_get_int_field(resp, "ssDataPort", &dport)==0 && json_get_string_field(resp, "ssAddr", ssaddr, sizeof(ssaddr))==0 && json_get_string_field(resp, "ticket", ticket, sizeof(ticket))==0); free(resp); close(fd); if (!ok || dport<=0) { fprintf(stderr, "ERROR: LOOKUP failed (no storage server available)\n"); return 1; }
         int sfd = tcp_connect(ssaddr, (uint16_t)dport); if (sfd < 0) { perror("connect SS"); return 1; }
         char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "STREAM", 1); json_put_string_field(req, sizeof(req), "file", file, 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
@@ -765,6 +900,8 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
             if (!*end) { fprintf(stderr, "ERROR: missing content\n"); continue; }
             // trim trailing newline
             size_t clen = strlen(end); if (clen && end[clen-1]=='\n') end[--clen]='\0';
+            // Process escape sequences
+            unescape_string(end);
             char areq[1200]; areq[0]='\0'; json_put_string_field(areq, sizeof(areq), "type", "APPLY", 1); json_put_int_field(areq, sizeof(areq), "wordIndex", (int)widx, 0); json_put_string_field(areq, sizeof(areq), "content", end, 0); strncat(areq, "}", sizeof(areq)-strlen(areq)-1);
             if (send_msg(sfd, areq, (uint32_t)strlen(areq)) != 0) { perror("send APPLY"); break; }
             char *ar=NULL; uint32_t al=0; if (recv_msg(sfd, &ar, &al) != 0) { perror("recv APPLY"); break; } print_human("SS", ar); free(ar);
@@ -841,8 +978,9 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         free(r2); close(sfd);
         return 0;
     } else if (CMDEQ(cmd, "ADDACCESS")) {
-        if (argc < 7) { fprintf(stderr, "ADDACCESS requires -R|-W <file> <user>\n"); close(fd); return 1; }
-        const char *flag = argv[4]; const char *file = argv[5]; const char *user = argv[6]; const char *mode = (strcmp(flag, "-W")==0?"RW":"R");
+        if (argc < 7) { fprintf(stderr, "ADDACCESS requires -r|-w <file> <user>\n"); close(fd); return 1; }
+        const char *flag = argv[4]; const char *file = argv[5]; const char *user = argv[6]; 
+        const char *mode = (strcmp(flag, "-w")==0 || strcmp(flag, "-rw")==0 || strcmp(flag, "-wr")==0)?"RW":"R";
         json_put_string_field(payload, sizeof(payload), "type", "ADDACCESS", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
         json_put_string_field(payload, sizeof(payload), "user", user, 0);
@@ -876,11 +1014,11 @@ static int client_handle_oneshot(int argc, char **argv, const char *username) {
         json_put_string_field(payload, sizeof(payload), "user", username, 0);
         strncat(payload, "}", sizeof(payload) - strlen(payload) - 1);
     } else if (CMDEQ(cmd, "REQUEST_ACCESS")) {
-        if (argc < 5) { fprintf(stderr, "REQUEST_ACCESS requires <file> [ -R | -W ]\n"); close(fd); return 1; }
+        if (argc < 5) { fprintf(stderr, "REQUEST_ACCESS requires <file> [ -r | -w ]\n"); close(fd); return 1; }
         const char *file = argv[4]; const char *mode = "R";
         if (argc >= 6) {
-            if (strcmp(argv[5], "-W") == 0) mode = "W";
-            else if (strcmp(argv[5], "-R") == 0) mode = "R";
+            if (strcmp(argv[5], "-w") == 0 || strcmp(argv[5], "-rw") == 0 || strcmp(argv[5], "-wr") == 0) mode = "W";
+            else if (strcmp(argv[5], "-r") == 0) mode = "R";
         }
         json_put_string_field(payload, sizeof(payload), "type", "REQUEST_ACCESS", 1);
         json_put_string_field(payload, sizeof(payload), "file", file, 0);
