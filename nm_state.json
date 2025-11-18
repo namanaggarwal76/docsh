@@ -1,0 +1,10 @@
+{
+  "users":["naman"],
+  "active":["naman"],
+  "directory":{"hello.txt":{"ss_id":2,"last_modified_user":"naman","last_modified_time":1763479384,"last_accessed_user":"naman","last_accessed_time":1763481079}},
+  "acls":{"hello.txt":{"owner":"naman","grants":{"naman":"RW"}}},
+  "replicas":{"hello.txt":[1]},
+  "requests":{},
+  "folders":[],
+  "trash":[]
+}

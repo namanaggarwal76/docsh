@@ -55,6 +55,16 @@ size_t nm_state_get_replicas(const char *file, int *out, size_t max);
 // Convenience: get primary ssId for a file (wraps directory mapping). Returns 0 on success, -1 if not found.
 int nm_state_get_primary(const char *file, int *out_ssid);
 
+// --- Metadata tracking (last modified/accessed user and time) ---
+// Set last modified user and time for a file; returns 1 on success, 0 if file not found
+int nm_state_set_file_modified(const char *file, const char *user, int time);
+
+// Set last accessed user and time for a file; returns 1 on success, 0 if file not found
+int nm_state_set_file_accessed(const char *file, const char *user, int time);
+
+// Get file metadata (last modified/accessed user and time); returns 0 on success, -1 if file not found
+int nm_state_get_file_metadata(const char *file, char *mod_user_out, size_t mod_user_sz, int *mod_time_out, char *acc_user_out, size_t acc_user_sz, int *acc_time_out);
+
 // --- ACLs (M7) ---
 // Permissions bitmask
 #define ACL_R 1

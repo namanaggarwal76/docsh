@@ -35,7 +35,6 @@ static pthread_mutex_t g_lock_mu = PTHREAD_MUTEX_INITIALIZER;
 
 // Forward declaration (defined later in file)
 static void ensure_parent_dirs_for(const char *path);
-static void history_save_snapshot(const char *file, const char *data, size_t len);
 
 // Snapshot-based read isolation removed; readers always see the latest committed file.
 
@@ -86,7 +85,6 @@ static void ensure_dirs(void) {
     snprintf(p, sizeof(p), "%s/meta", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/undo", g_store_root); mkdir(p, 0755);
     snprintf(p, sizeof(p), "%s/checkpoints", g_store_root); mkdir(p, 0755);
-    snprintf(p, sizeof(p), "%s/history", g_store_root); mkdir(p, 0755);
 }
 
 static void *heartbeat_thread(void *arg) {
@@ -133,39 +131,7 @@ static void ensure_parent_dirs_for(const char *path) {
 // If the source file doesn't exist, create an empty undo file (so UNDO restores to empty).
 // (removed) save_undo_snapshot: replaced by session-based snapshot writing in END_WRITE
 
-// Best-effort history snapshot: stores the provided data into
-//   <g_store_root>/history/<file>.<N>.snap
-// where N is 1 + max existing version for that file. Creates directories if needed.
-static void history_save_snapshot(const char *file, const char *data, size_t len) {
-    if (!file || !file[0]) return;
-    char hdir[SS_PATH_MAX]; snprintf(hdir, sizeof(hdir), "%s/history", g_store_root);
-    // Ensure history directory exists
-    mkdir(hdir, 0755);
-    int next = 1;
-    DIR *d = opendir(hdir);
-    if (d) {
-        size_t flen = strlen(file);
-        struct dirent *de;
-        while ((de = readdir(d)) != NULL) {
-            const char *name = de->d_name;
-            if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                const char *rest = name + flen + 1;
-                char *ep = NULL; long val = strtol(rest, &ep, 10);
-                if (ep && strcmp(ep, ".snap") == 0 && val >= next) {
-                    if (val + 1 > next) next = (int)(val + 1);
-                }
-            }
-        }
-        closedir(d);
-    }
-    char hpath[SS_PATH_MAX]; snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, next);
-    ensure_parent_dirs_for(hpath);
-    FILE *f = fopen(hpath, "wb");
-    if (!f) { perror("[SS] history fopen"); return; }
-    if (data && len > 0) { (void)fwrite(data, 1, len, f); }
-    fflush(f); fclose(f);
-    fprintf(stderr, "[SS] history snapshot saved: %s (len=%zu)\n", hpath, len);
-}
+
 
 static void json_escape_append(char *dst, size_t dst_sz, const char *s) {
     while (*s && strlen(dst) + 2 < dst_sz) {
@@ -197,8 +163,6 @@ typedef struct conn_write_session {
     char *pre_image;
     size_t pre_image_len;
 } conn_write_session_t;
-
-// History feature removed: checkpoints + single-level UNDO remain.
 
 // Per-connection handler to allow concurrent clients (top-level C function)
 typedef struct { int cfd; } conn_args_t;
@@ -276,20 +240,6 @@ static void *ss_conn_handler(void *varg) {
                         }
                         closedir(cd);
                         (void)rmdir(chkdir);
-                    }
-                    // Remove history snapshots for file
-                    char hdir[SS_PATH_MAX]; snprintf(hdir, sizeof(hdir), "%s/history", g_store_root);
-                    DIR *hd = opendir(hdir);
-                    if (hd) {
-                        size_t flen = strlen(file); struct dirent *de;
-                        while ((de = readdir(hd)) != NULL) {
-                            const char *name = de->d_name;
-                            if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                char hp[SS_PATH_MAX]; snprintf(hp, sizeof(hp), "%s/history/%s", g_store_root, name);
-                                (void)unlink(hp);
-                            }
-                        }
-                        closedir(hd);
                     }
                     if (ok) { const char *resp = "{\"status\":\"OK\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
@@ -431,11 +381,10 @@ static void *ss_conn_handler(void *varg) {
                             size_t n = fwrite(new_text, 1, strlen(new_text), f);
                             (void)n; fflush(f);
                             fclose(f);
-                            // Snapshot for UNDO and HISTORY from session pre_image (best-effort)
+                            // Snapshot for UNDO from session pre_image (best-effort)
                             ensure_parent_dirs_for(undopath);
                             FILE *uf = fopen(undopath, "wb");
                             if (uf) { if (ws.pre_image && ws.pre_image_len > 0) fwrite(ws.pre_image, 1, ws.pre_image_len, uf); fflush(uf); fclose(uf); fprintf(stderr, "[SS] undo snapshot saved from session: %s (len=%zu)\n", undopath, ws.pre_image_len);} else { perror("[SS] undo fopen"); }
-                            history_save_snapshot(ws.file, ws.pre_image, ws.pre_image_len);
                             if (rename(tmppath, path) != 0) {
                                 perror("[SS] rename");
                                 unlink(tmppath); free(new_text); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp));
@@ -484,7 +433,6 @@ static void *ss_conn_handler(void *varg) {
                             snprintf(tmppath, sizeof(tmppath), "%s", mp);
                             strncat(tmppath, "/undo.tmp", sizeof(tmppath) - strlen(tmppath) - 1);
                         }
-                    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
                     char path2[SS_PATH_MAX]; snprintf(path2, sizeof(path2), "%s/files/%s", g_store_root, file);
                         FILE *f = fopen(tmppath, "wb");
                         if (!f) { free(undo_content); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
@@ -501,53 +449,21 @@ static void *ss_conn_handler(void *varg) {
                         }
                     }
                 }
-            } else if (strcmp(type, "HISTORY") == 0) {
-                char file[128]; char ticket[256];
-                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
-                int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                if (!okf || !okt) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                else if (ticket_validate(ticket, file, "HISTORY", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
-                else {
-                    // Build versions list
-                    char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
-                    DIR *d = opendir(dpath);
-                    char resp[4096]; size_t w=0; w += snprintf(resp+w, sizeof(resp)-w, "{\"status\":\"OK\",\"versions\":[");
-                    if (d) {
-                        size_t flen = strlen(file); int first=1; struct dirent *de;
-                        while ((de = readdir(d)) != NULL) {
-                            const char *name = de->d_name;
-                            if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                const char *rest = name + flen + 1; char *ep=NULL; long val=strtol(rest,&ep,10);
-                                if (ep && strcmp(ep, ".snap")==0 && val>0) {
-                                    if (!first) w += snprintf(resp+w, sizeof(resp)-w, ",");
-                                    first=0; w += snprintf(resp+w, sizeof(resp)-w, "%ld", val);
-                                }
-                            }
-                        }
-                        closedir(d);
-                    }
-                    if (w < sizeof(resp)) w += snprintf(resp+w, sizeof(resp)-w, "]}");
-                    send_msg(cfd, resp, (uint32_t)strlen(resp));
-                }
             } else if (strcmp(type, "REVERT") == 0) {
-                char file[128]; char ticket[256]; int ver=0; char cname[256]; cname[0]='\0';
+                char file[128]; char ticket[256]; char cname[256]; cname[0]='\0';
                 int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
                 int okt = (json_get_string_field(buf, "ticket", ticket, sizeof(ticket)) == 0);
-                (void)json_get_int_field(buf, "version", &ver);
                 (void)json_get_string_field(buf, "name", cname, sizeof(cname));
-                if (!okf || !okt || ((ver<=0) && !cname[0])) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                if (!okf || !okt || !cname[0]) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                 else if (ticket_validate(ticket, file, "REVERT", g_ss_id) != 0) { const char *resp = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                 else {
-                    char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
-                    // Save pre-revert into history
-                    char *cur=NULL; size_t clen=0; if (read_file_into(path, &cur, &clen)==0) { history_save_snapshot(file, cur, clen); free(cur);} 
-                    // Load snapshot to revert to (by version or checkpoint name)
+                    // Load checkpoint snapshot to revert to
                     char hpath[SS_PATH_MAX];
-                    if (cname[0]) snprintf(hpath, sizeof(hpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, cname);
-                    else snprintf(hpath, sizeof(hpath), "%s/history/%s.%d.snap", g_store_root, file, ver);
+                    snprintf(hpath, sizeof(hpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, cname);
                     char *snap=NULL; size_t slen=0;
                     if (read_file_into(hpath, &snap, &slen) != 0) { const char *resp = "{\"status\":\"ERR_NOTFOUND\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {
+                        char path[SS_PATH_MAX]; snprintf(path, sizeof(path), "%s/files/%s", g_store_root, file);
                         char tmppath[SS_PATH_MAX]; size_t pl=strlen(path);
                         if (pl + 6 + 1 <= sizeof(tmppath)) snprintf(tmppath, sizeof(tmppath), "%s.rvtmp", path); else { char mp[SS_PATH_MAX]; snprintf(mp, sizeof(mp), "%s/meta", g_store_root); mkdir(mp,0755); snprintf(tmppath, sizeof(tmppath), "%s", mp); strncat(tmppath, "/revert.tmp", sizeof(tmppath)-strlen(tmppath)-1);} 
                         FILE *f = fopen(tmppath, "wb"); if (!f) { free(snap); const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
@@ -641,23 +557,6 @@ static void *ss_conn_handler(void *varg) {
                             ensure_parent_dirs_for(c_new);
                             // Attempt directory rename (will move the folder atomically within same filesystem)
                             (void)rename(c_old, c_new);
-                        }
-                        // Rename history snapshots
-                        char dpath[SS_PATH_MAX]; snprintf(dpath, sizeof(dpath), "%s/history", g_store_root);
-                        DIR *d = opendir(dpath);
-                        if (d) {
-                            size_t flen = strlen(file); struct dirent *de;
-                            while ((de = readdir(d)) != NULL) {
-                                const char *name = de->d_name;
-                                if (strncmp(name, file, flen) == 0 && name[flen] == '.') {
-                                    char src[SS_PATH_MAX]; char dst[SS_PATH_MAX];
-                                    snprintf(src, sizeof(src), "%s/history/%s", g_store_root, name);
-                                    snprintf(dst, sizeof(dst), "%s/history/%s%s", g_store_root, nfile, name + flen);
-                                    ensure_parent_dirs_for(dst);
-                                    (void)rename(src, dst);
-                                }
-                            }
-                            closedir(d);
                         }
                         // Finally rename main file
                         ensure_parent_dirs_for(path_new);

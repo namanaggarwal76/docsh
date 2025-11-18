@@ -280,7 +280,28 @@ static void *client_thread(void *arg) {
                             if (sfd >= 0) {
                                 char req[256]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "CREATE", 1); json_put_string_field(req, sizeof(req), "file", file, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
                                 if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
-                                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) { nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W); (void)nm_state_save("nm_state.json"); }
+                                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                        nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
+                                        
+                                        // Set up replicas for auto-provisioned file
+                                        int replicas[16]; size_t nr = 0;
+                                        pthread_mutex_lock(&g_mu);
+                                        for (ss_entry_t *e = g_ss_list; e && nr < 16; e = e->next) {
+                                            if (e->ss_id != chosen_ssid && e->is_up && e->ss_data_port > 0) {
+                                                replicas[nr++] = e->ss_id;
+                                                if (nr >= 1) break; // Limit to 1 replica
+                                            }
+                                        }
+                                        pthread_mutex_unlock(&g_mu);
+                                        if (nr > 0) {
+                                            nm_state_set_replicas(file, replicas, nr);
+                                            for (size_t i = 0; i < nr; i++) {
+                                                schedule_cmd_repl("CREATE", file, NULL, replicas[i]);
+                                            }
+                                        }
+                                        
+                                        (void)nm_state_save("nm_state.json");
+                                    }
                                     if (r) free(r);
                                 }
                                 close(sfd);
@@ -302,6 +323,15 @@ static void *client_thread(void *arg) {
                     if ((strcmp(op, "READ") == 0 && nm_acl_check(file, user, "READ") != 0) || (strcmp(op, "WRITE") == 0 && nm_acl_check(file, user, "WRITE") != 0)) {
                         const char *er = "{\"status\":\"ERR_NOAUTH\"}"; send_msg(fd, er, (uint32_t)strlen(er));
                     } else {
+                        // Update metadata: track access time for READ, modification time for WRITE
+                        int now = (int)time(NULL);
+                        if (strcmp(op, "READ") == 0) {
+                            nm_state_set_file_accessed(file, user, now);
+                        } else if (strcmp(op, "WRITE") == 0) {
+                            nm_state_set_file_modified(file, user, now);
+                        }
+                        (void)nm_state_save("nm_state.json");
+                        
                         char ticket2[256]; if (ticket_build(file, op, ssid, 600, ticket2, sizeof(ticket2)) != 0) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                         else { int dport2=0; pthread_mutex_lock(&g_mu); for (ss_entry_t *e=g_ss_list; e; e=e->next){ if(e->ss_id==ssid){ dport2=e->ss_data_port; break; } } pthread_mutex_unlock(&g_mu); if (dport2){ char resp2[512]; snprintf(resp2,sizeof(resp2),"{\"status\":\"OK\",\"ssAddr\":\"%s\",\"ssDataPort\":%d,\"ticket\":\"%s\"}", "127.0.0.1", dport2, ticket2); send_msg(fd, resp2, (uint32_t)strlen(resp2)); } else { const char *er="{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } }
                     }
@@ -330,6 +360,25 @@ static void *client_thread(void *arg) {
                                 char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl)==0 && r && strstr(r, "\"status\":\"OK\"")) {
                                     nm_dir_set(file, chosen_ssid); nm_acl_set_owner(file, user); nm_acl_grant(file, user, ACL_R|ACL_W);
                                     if (pubR || pubW) { int anonPerm=0; if (pubR) anonPerm |= ACL_R; if (pubW) anonPerm |= (ACL_R|ACL_W); if (anonPerm) nm_acl_grant(file, "anonymous", anonPerm); }
+                                    
+                                    // Set up replicas: pick other available SS as replica (1 replica only)
+                                    int replicas[16]; size_t nr = 0;
+                                    pthread_mutex_lock(&g_mu);
+                                    for (ss_entry_t *e = g_ss_list; e && nr < 16; e = e->next) {
+                                        if (e->ss_id != chosen_ssid && e->is_up && e->ss_data_port > 0) {
+                                            replicas[nr++] = e->ss_id;
+                                            if (nr >= 1) break; // Limit to 1 replica
+                                        }
+                                    }
+                                    pthread_mutex_unlock(&g_mu);
+                                    if (nr > 0) {
+                                        nm_state_set_replicas(file, replicas, nr);
+                                        // Asynchronously replicate initial empty file to replicas
+                                        for (size_t i = 0; i < nr; i++) {
+                                            schedule_cmd_repl("CREATE", file, NULL, replicas[i]);
+                                        }
+                                    }
+                                    
                                     (void)nm_state_save("nm_state.json"); const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
                                 } else { const char *er="{\"status\":\"ERR_INTERNAL\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
                                 if (r) free(r);
@@ -1023,7 +1072,13 @@ static void *client_thread(void *arg) {
                                         free(r); close(sfd);
                                         char owner[128]; owner[0]='\0'; (void)nm_acl_get_owner(file, owner, sizeof(owner));
                                         char access[1024]; access[0]='\0'; (void)nm_acl_format_access(file, access, sizeof(access));
-                                        char resp[2048]; snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"file\":\"%s\",\"owner\":\"%s\",\"size\":%d,\"words\":%d,\"chars\":%d,\"mtime\":%d,\"atime\":%d,\"access\":\"%s\"}", file, owner, size, words, chars, mtime, atime, access);
+                                        
+                                        // Get metadata tracking info
+                                        char mod_user[128] = {0}, acc_user[128] = {0};
+                                        int mod_time = 0, acc_time = 0;
+                                        (void)nm_state_get_file_metadata(file, mod_user, sizeof(mod_user), &mod_time, acc_user, sizeof(acc_user), &acc_time);
+                                        
+                                        char resp[2048]; snprintf(resp, sizeof(resp), "{\"status\":\"OK\",\"file\":\"%s\",\"owner\":\"%s\",\"size\":%d,\"words\":%d,\"chars\":%d,\"mtime\":%d,\"atime\":%d,\"access\":\"%s\",\"last_modified_user\":\"%s\",\"last_modified_time\":%d,\"last_accessed_user\":\"%s\",\"last_accessed_time\":%d}", file, owner, size, words, chars, mtime, atime, access, mod_user[0] ? mod_user : "", mod_time, acc_user[0] ? acc_user : "", acc_time);
                                         send_msg(fd, resp, (uint32_t)strlen(resp));
                                     }
                                 }
@@ -1054,6 +1109,16 @@ static void *client_thread(void *arg) {
                                     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) { send_msg(fd, r, rl); free(r);} else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } close(sfd); }
                                     else {
                                         char body[8192]; body[0]='\0'; (void)json_get_string_field(r, "body", body, sizeof(body)); free(r); close(sfd);
+                                        // Find first available SS data folder for execution context
+                                        char exec_dir[512]; exec_dir[0]='\0';
+                                        pthread_mutex_lock(&g_mu);
+                                        for (ss_entry_t *e = g_ss_list; e; e = e->next) {
+                                            if (e->is_up && e->ss_id > 0) {
+                                                snprintf(exec_dir, sizeof(exec_dir), "ss_data/ss%d/files", e->ss_id);
+                                                break;
+                                            }
+                                        }
+                                        pthread_mutex_unlock(&g_mu);
                                         // Execute via /bin/sh reading the script from stdin; capture stdout+stderr via pipe
                                         int out_pipe[2]; int in_pipe[2];
                                         if (pipe(out_pipe) != 0 || pipe(in_pipe) != 0) {
@@ -1071,6 +1136,8 @@ static void *client_thread(void *arg) {
                                                 // Close inherited fds
                                                 close(in_pipe[0]); close(in_pipe[1]);
                                                 close(out_pipe[0]); close(out_pipe[1]);
+                                                // Change to data directory if available
+                                                if (exec_dir[0]) { int rc = chdir(exec_dir); (void)rc; }
                                                 // Exec /bin/sh -s (read from stdin)
                                                 execl("/bin/sh", "sh", "-s", (char *)NULL);
                                                 _exit(127);
@@ -1096,10 +1163,18 @@ static void *client_thread(void *arg) {
                                                 if (w < sizeof(outbuf)) outbuf[w] = '\0'; else outbuf[sizeof(outbuf)-1] = '\0';
                                                 close(out_pipe[0]);
                                                 int status=0; (void)waitpid(pid, &status, 0);
-                                                // Build JSON response
+                                                // Build JSON response with properly escaped output
                                                 char j[16384]; j[0]='\0'; strncat(j, "{\"status\":\"OK\",\"output\":\"", sizeof(j)-strlen(j)-1);
                                                 size_t wlen = strlen(outbuf);
-                                                for (size_t i=0;i<wlen && strlen(j)+2<sizeof(j);++i){ char ch=outbuf[i]; if (ch=='"' || ch=='\\') strncat(j, "\\", sizeof(j)-strlen(j)-1); if (ch=='\n') strncat(j, "\\n", sizeof(j)-strlen(j)-1); else { char s[2]={ch,0}; strncat(j,s, sizeof(j)-strlen(j)-1);} }
+                                                for (size_t i=0;i<wlen && strlen(j)+4<sizeof(j);++i){ 
+                                                    char ch=outbuf[i]; 
+                                                    if (ch=='\\') { strncat(j, "\\\\", sizeof(j)-strlen(j)-1); } 
+                                                    else if (ch=='"') { strncat(j, "\\\"", sizeof(j)-strlen(j)-1); } 
+                                                    else if (ch=='\n') { strncat(j, "\\n", sizeof(j)-strlen(j)-1); } 
+                                                    else if (ch=='\r') { strncat(j, "\\r", sizeof(j)-strlen(j)-1); } 
+                                                    else if (ch=='\t') { strncat(j, "\\t", sizeof(j)-strlen(j)-1); } 
+                                                    else { char s[2]={ch,0}; strncat(j,s, sizeof(j)-strlen(j)-1);} 
+                                                }
                                                 strncat(j, "\"}", sizeof(j)-strlen(j)-1);
                                                 send_msg(fd, j, (uint32_t)strlen(j));
                                             }

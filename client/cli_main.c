@@ -175,7 +175,6 @@ static void print_human(const char *who, const char *json) {
             printf("%s\n", body);
             return;
         }
-        // HISTORY removed: versions list no longer emitted
         // VIEWREQUESTS: requests list
         if (strstr(json, "\"requests\":")) {
             if (color) printf("%sRequests:%s\n", C, Z); else printf("Requests:\n");
@@ -301,13 +300,17 @@ static void print_human(const char *who, const char *json) {
         {
             char out[8192];
             if (json_get_string_field(json, "output", out, sizeof(out)) == 0) {
-                printf("%s\n", out);
+                // Output is already unescaped by json_get_string_field, print as-is
+                printf("%s", out);
                 return;
             }
         }
         // INFO pretty print
         {
             char fname[256]; char owner[128]; int size=0, words=0, chars=0, mtime=0, atime=0; int got=0;
+            char mod_user[128] = {0}, acc_user[128] = {0};
+            int mod_time = 0, acc_time = 0;
+            
             if (json_get_string_field(json, "file", fname, sizeof(fname)) == 0) got=1;
             (void)json_get_string_field(json, "owner", owner, sizeof(owner));
             (void)json_get_int_field(json, "size", &size);
@@ -315,18 +318,32 @@ static void print_human(const char *who, const char *json) {
             (void)json_get_int_field(json, "chars", &chars);
             (void)json_get_int_field(json, "mtime", &mtime);
             (void)json_get_int_field(json, "atime", &atime);
+            (void)json_get_string_field(json, "last_modified_user", mod_user, sizeof(mod_user));
+            (void)json_get_int_field(json, "last_modified_time", &mod_time);
+            (void)json_get_string_field(json, "last_accessed_user", acc_user, sizeof(acc_user));
+            (void)json_get_int_field(json, "last_accessed_time", &acc_time);
+            
             if (got) {
-                char mtime_s[32], atime_s[32];
+                char mtime_s[32], atime_s[32], mod_time_s[32], acc_time_s[32];
                 format_time_hr(mtime, mtime_s, sizeof(mtime_s));
                 format_time_hr(atime, atime_s, sizeof(atime_s));
+                format_time_hr(mod_time, mod_time_s, sizeof(mod_time_s));
+                format_time_hr(acc_time, acc_time_s, sizeof(acc_time_s));
+                
                 printf("--> File: %s\n", fname);
                 printf("--> Owner: %s\n", owner[0]?owner:"-");
                 printf("--> Created: %s\n", mtime_s);
-                printf("--> Last Modified: %s\n", mtime_s);
+                printf("--> Last Modified: %s%s%s\n", 
+                       mod_time > 0 ? mod_time_s : mtime_s,
+                       mod_user[0] ? " by " : "",
+                       mod_user[0] ? mod_user : "");
                 printf("--> Size: %d bytes\n", size);
                 printf("--> Access: ");
                 char acc[1024]; if (json_get_string_field(json, "access", acc, sizeof(acc))==0) printf("%s\n", acc); else printf("-\n");
-                printf("--> Last Accessed: %s\n", atime_s);
+                printf("--> Last Accessed: %s%s%s\n", 
+                       acc_time > 0 ? acc_time_s : atime_s,
+                       acc_user[0] ? " by " : "",
+                       acc_user[0] ? acc_user : "");
                 return;
             }
         }

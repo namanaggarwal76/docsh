@@ -18,7 +18,7 @@ typedef struct {
     char **active_users;
     size_t n_active;
     size_t cap_active;
-    struct dir_entry { char *file; int ss_id; int *replicas; size_t n_repl; size_t cap_repl; } *dir;
+    struct dir_entry { char *file; int ss_id; int *replicas; size_t n_repl; size_t cap_repl; char *last_modified_user; int last_modified_time; char *last_accessed_user; int last_accessed_time; } *dir;
     size_t n_dir;
     size_t cap_dir;
     struct acl_entry { char *file; char *owner; struct acl_user *grants; size_t n_grants; size_t cap_grants; } *acls;
@@ -191,9 +191,43 @@ int nm_state_save(const char *path) {
             char ch[2] = {*s, 0};
             strncat(buf, ch, bufcap - strlen(buf) - 1);
         }
-        strcat(buf, "\":");
+        strcat(buf, "\":{\"ss_id\":");
         char num[32]; snprintf(num, sizeof(num), "%d", g_state.dir[i].ss_id);
         strncat(buf, num, bufcap - strlen(buf) - 1);
+        // Add metadata fields
+        strcat(buf, ",\"last_modified_user\":");
+        if (g_state.dir[i].last_modified_user && *g_state.dir[i].last_modified_user) {
+            strcat(buf, "\"");
+            s = g_state.dir[i].last_modified_user;
+            for (; *s; ++s) {
+                if (*s == '"' || *s == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1);
+                char ch[2] = {*s, 0};
+                strncat(buf, ch, bufcap - strlen(buf) - 1);
+            }
+            strcat(buf, "\"");
+        } else {
+            strcat(buf, "null");
+        }
+        strcat(buf, ",\"last_modified_time\":");
+        snprintf(num, sizeof(num), "%d", g_state.dir[i].last_modified_time);
+        strncat(buf, num, bufcap - strlen(buf) - 1);
+        strcat(buf, ",\"last_accessed_user\":");
+        if (g_state.dir[i].last_accessed_user && *g_state.dir[i].last_accessed_user) {
+            strcat(buf, "\"");
+            s = g_state.dir[i].last_accessed_user;
+            for (; *s; ++s) {
+                if (*s == '"' || *s == '\\') strncat(buf, "\\", bufcap - strlen(buf) - 1);
+                char ch[2] = {*s, 0};
+                strncat(buf, ch, bufcap - strlen(buf) - 1);
+            }
+            strcat(buf, "\"");
+        } else {
+            strcat(buf, "null");
+        }
+        strcat(buf, ",\"last_accessed_time\":");
+        snprintf(num, sizeof(num), "%d", g_state.dir[i].last_accessed_time);
+        strncat(buf, num, bufcap - strlen(buf) - 1);
+        strcat(buf, "}");
     }
     strcat(buf, "},\n  \"acls\":{");
     for (size_t i = 0; i < g_state.n_acls; ++i) {
@@ -364,13 +398,87 @@ static void parse_directory_object(const char *json) {
         while (*p && *p != ':') p++;
         if (*p == ':') p++;
         while (*p == ' ' || *p == '\n' || *p == '\t') p++;
-        // read integer value
-        const char *vstart = p;
-        while (*p && *p != ',' && *p != '}') p++;
-        char vbuf[32]; size_t vlen = (size_t)(p - vstart); if (vlen >= sizeof(vbuf)) vlen = sizeof(vbuf)-1;
-        memcpy(vbuf, vstart, vlen); vbuf[vlen] = '\0';
-        int ssid = atoi(vbuf);
-        nm_state_set_dir(key, ssid);
+        
+        // Check if value is an object or integer (backwards compatibility)
+        if (*p == '{') {
+            // New format: object with ss_id and metadata
+            p++;
+            int ssid = 0;
+            char mod_user[128] = {0};
+            int mod_time = 0;
+            char acc_user[128] = {0};
+            int acc_time = 0;
+            
+            while (*p && *p != '}') {
+                while (*p == ' ' || *p == '\n' || *p == '\t' || *p == ',') p++;
+                if (*p == '}') break;
+                if (*p != '"') break;
+                p++;
+                const char *fstart = p;
+                while (*p && *p != '"') { if (*p == '\\' && p[1]) p += 2; else p++; }
+                size_t flen = (size_t)(p - fstart);
+                char field[64];
+                size_t fj = 0; const char *fs = fstart;
+                while (fj < flen && *fs && fj < sizeof(field) - 1) {
+                    if (*fs == '\\' && fs[1]) { fs++; field[fj++] = *fs++; }
+                    else { field[fj++] = *fs++; }
+                }
+                field[fj] = '\0';
+                if (*p == '"') p++;
+                while (*p && *p != ':') p++;
+                if (*p == ':') p++;
+                while (*p == ' ' || *p == '\n' || *p == '\t') p++;
+                
+                if (strcmp(field, "ss_id") == 0) {
+                    const char *vstart = p;
+                    while (*p && *p != ',' && *p != '}') p++;
+                    char vbuf[32]; size_t vlen = (size_t)(p - vstart); if (vlen >= sizeof(vbuf)) vlen = sizeof(vbuf)-1;
+                    memcpy(vbuf, vstart, vlen); vbuf[vlen] = '\0';
+                    ssid = atoi(vbuf);
+                } else if (strcmp(field, "last_modified_user") == 0 || strcmp(field, "last_accessed_user") == 0) {
+                    if (*p == '"') {
+                        p++;
+                        const char *ustart = p;
+                        while (*p && *p != '"') { if (*p == '\\' && p[1]) p += 2; else p++; }
+                        size_t ulen = (size_t)(p - ustart);
+                        char *target = strcmp(field, "last_modified_user") == 0 ? mod_user : acc_user;
+                        size_t uj = 0; const char *us = ustart;
+                        while (uj < ulen && *us && uj < 127) {
+                            if (*us == '\\' && us[1]) { us++; target[uj++] = *us++; }
+                            else { target[uj++] = *us++; }
+                        }
+                        target[uj] = '\0';
+                        if (*p == '"') p++;
+                    } else if (*p == 'n' && strncmp(p, "null", 4) == 0) {
+                        p += 4;
+                    }
+                } else if (strcmp(field, "last_modified_time") == 0 || strcmp(field, "last_accessed_time") == 0) {
+                    const char *vstart = p;
+                    while (*p && *p != ',' && *p != '}') p++;
+                    char vbuf[32]; size_t vlen = (size_t)(p - vstart); if (vlen >= sizeof(vbuf)) vlen = sizeof(vbuf)-1;
+                    memcpy(vbuf, vstart, vlen); vbuf[vlen] = '\0';
+                    if (strcmp(field, "last_modified_time") == 0) {
+                        mod_time = atoi(vbuf);
+                    } else {
+                        acc_time = atoi(vbuf);
+                    }
+                }
+            }
+            if (*p == '}') p++;
+            
+            // Set directory entry with metadata
+            nm_state_set_dir(key, ssid);
+            if (mod_user[0]) nm_state_set_file_modified(key, mod_user, mod_time);
+            if (acc_user[0]) nm_state_set_file_accessed(key, acc_user, acc_time);
+        } else {
+            // Old format: just integer ssid (backwards compatibility)
+            const char *vstart = p;
+            while (*p && *p != ',' && *p != '}') p++;
+            char vbuf[32]; size_t vlen = (size_t)(p - vstart); if (vlen >= sizeof(vbuf)) vlen = sizeof(vbuf)-1;
+            memcpy(vbuf, vstart, vlen); vbuf[vlen] = '\0';
+            int ssid = atoi(vbuf);
+            nm_state_set_dir(key, ssid);
+        }
         if (*p == ',') p++;
     }
 }
@@ -631,6 +739,10 @@ int nm_state_set_dir(const char *file, int ss_id) {
     if (!g_state.dir[g_state.n_dir].file) return 0;
     g_state.dir[g_state.n_dir].ss_id = ss_id;
     g_state.dir[g_state.n_dir].replicas = NULL; g_state.dir[g_state.n_dir].n_repl = 0; g_state.dir[g_state.n_dir].cap_repl = 0;
+    g_state.dir[g_state.n_dir].last_modified_user = NULL;
+    g_state.dir[g_state.n_dir].last_modified_time = 0;
+    g_state.dir[g_state.n_dir].last_accessed_user = NULL;
+    g_state.dir[g_state.n_dir].last_accessed_time = 0;
     g_state.n_dir++;
     return 1;
 }
@@ -661,6 +773,8 @@ int nm_state_del_dir(const char *file) {
         if (strcmp(g_state.dir[i].file, file) == 0) {
             free(g_state.dir[i].file);
             if (g_state.dir[i].replicas) { free(g_state.dir[i].replicas); g_state.dir[i].replicas=NULL; }
+            if (g_state.dir[i].last_modified_user) { free(g_state.dir[i].last_modified_user); g_state.dir[i].last_modified_user=NULL; }
+            if (g_state.dir[i].last_accessed_user) { free(g_state.dir[i].last_accessed_user); g_state.dir[i].last_accessed_user=NULL; }
             // move last into i
             if (i != g_state.n_dir - 1) g_state.dir[i] = g_state.dir[g_state.n_dir - 1];
             g_state.n_dir--;
@@ -731,6 +845,59 @@ size_t nm_state_get_replicas(const char *file, int *out, size_t max) {
 
 int nm_state_get_primary(const char *file, int *out_ssid) {
     return nm_state_find_dir(file, out_ssid);
+}
+
+// ---- Metadata tracking (last modified/accessed user and time) ----
+int nm_state_set_file_modified(const char *file, const char *user, int time) {
+    if (!file || !*file) return 0;
+    for (size_t i = 0; i < g_state.n_dir; ++i) {
+        if (strcmp(g_state.dir[i].file, file) == 0) {
+            if (g_state.dir[i].last_modified_user) free(g_state.dir[i].last_modified_user);
+            g_state.dir[i].last_modified_user = (user && *user) ? strdup(user) : NULL;
+            g_state.dir[i].last_modified_time = time;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int nm_state_set_file_accessed(const char *file, const char *user, int time) {
+    if (!file || !*file) return 0;
+    for (size_t i = 0; i < g_state.n_dir; ++i) {
+        if (strcmp(g_state.dir[i].file, file) == 0) {
+            if (g_state.dir[i].last_accessed_user) free(g_state.dir[i].last_accessed_user);
+            g_state.dir[i].last_accessed_user = (user && *user) ? strdup(user) : NULL;
+            g_state.dir[i].last_accessed_time = time;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int nm_state_get_file_metadata(const char *file, char *mod_user_out, size_t mod_user_sz, int *mod_time_out, char *acc_user_out, size_t acc_user_sz, int *acc_time_out) {
+    if (!file || !*file) return -1;
+    for (size_t i = 0; i < g_state.n_dir; ++i) {
+        if (strcmp(g_state.dir[i].file, file) == 0) {
+            if (mod_user_out && mod_user_sz) {
+                if (g_state.dir[i].last_modified_user) {
+                    snprintf(mod_user_out, mod_user_sz, "%s", g_state.dir[i].last_modified_user);
+                } else {
+                    mod_user_out[0] = '\0';
+                }
+            }
+            if (mod_time_out) *mod_time_out = g_state.dir[i].last_modified_time;
+            if (acc_user_out && acc_user_sz) {
+                if (g_state.dir[i].last_accessed_user) {
+                    snprintf(acc_user_out, acc_user_sz, "%s", g_state.dir[i].last_accessed_user);
+                } else {
+                    acc_user_out[0] = '\0';
+                }
+            }
+            if (acc_time_out) *acc_time_out = g_state.dir[i].last_accessed_time;
+            return 0;
+        }
+    }
+    return -1;
 }
 
 // ---- ACL helpers ----
