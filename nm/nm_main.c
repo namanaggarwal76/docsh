@@ -80,6 +80,25 @@ static int fetch_file_from_ss(const char *file, int ssid, char *out_body, size_t
     return ok ? 0 : -1;
 }
 
+// Helper: fetch checkpoint content from a given SS by name using VIEWCHECKPOINT ticket
+static int fetch_checkpoint_from_ss(const char *file, const char *cpname, int ssid, char *out_body, size_t out_sz) {
+    int data_port = 0; char ss_addr[64];
+    if (get_ss_info(ssid, &data_port, ss_addr, sizeof(ss_addr)) != 0 || data_port == 0) return -1;
+    char ticket[256]; if (ticket_build(file, "VIEWCHECKPOINT", ssid, 600, ticket, sizeof(ticket)) != 0) return -1;
+    int sfd = tcp_connect(ss_addr, (uint16_t)data_port); if (sfd < 0) return -1;
+    char req[512]; req[0]='\0';
+    json_put_string_field(req, sizeof(req), "type", "VIEWCHECKPOINT", 1);
+    json_put_string_field(req, sizeof(req), "file", file, 0);
+    json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
+    json_put_string_field(req, sizeof(req), "name", cpname, 0);
+    strncat(req, "}", sizeof(req)-strlen(req)-1);
+    if (send_msg(sfd, req, (uint32_t)strlen(req)) != 0) { close(sfd); return -1; }
+    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) free(r); close(sfd); return -1; }
+    int ok = (json_get_string_field(r, "body", out_body, out_sz) == 0);
+    free(r); close(sfd);
+    return ok ? 0 : -1;
+}
+
 // Fire-and-forget PUT replicate to a target ssid (fetches from primary)
 typedef struct { char file[128]; int primary_ssid; int target_ssid; } repl_put_args_t;
 static void *repl_put_thread(void *arg) {
@@ -105,6 +124,38 @@ static void schedule_put_repl(const char *file, int primary_ssid, int target_ssi
     repl_put_args_t *a = (repl_put_args_t *)malloc(sizeof(*a)); if (!a) return;
     snprintf(a->file, sizeof(a->file), "%s", file); a->primary_ssid = primary_ssid; a->target_ssid = target_ssid;
     pthread_t th; repq_inc(1); pthread_create(&th, NULL, repl_put_thread, a); pthread_detach(th);
+}
+
+// Fire-and-forget checkpoint replicate to a target ssid (fetches from primary)
+typedef struct { char file[128]; char name[256]; int primary_ssid; int target_ssid; } repl_cp_args_t;
+static void *repl_checkpoint_thread(void *arg) {
+    repl_cp_args_t *a = (repl_cp_args_t *)arg;
+    char body[8192]; body[0]='\0';
+    if (fetch_checkpoint_from_ss(a->file, a->name, a->primary_ssid, body, sizeof(body)) == 0) {
+        int dport = 0; char dest_addr[64];
+        if (get_ss_info(a->target_ssid, &dport, dest_addr, sizeof(dest_addr)) == 0 && dport) {
+            int dfd = tcp_connect(dest_addr, (uint16_t)dport);
+            if (dfd >= 0) {
+                char req[9216]; req[0]='\0';
+                json_put_string_field(req, sizeof(req), "type", "PUT_CHECKPOINT", 1);
+                json_put_string_field(req, sizeof(req), "file", a->file, 0);
+                json_put_string_field(req, sizeof(req), "name", a->name, 0);
+                json_put_string_field(req, sizeof(req), "body", body, 0);
+                strncat(req, "}", sizeof(req)-strlen(req)-1);
+                (void)send_msg(dfd, req, (uint32_t)strlen(req)); char *rr=NULL; uint32_t rrl=0; (void)recv_msg(dfd, &rr, &rrl); if (rr) free(rr); close(dfd);
+                fprintf(stderr, "[NM] Replicated CHECKPOINT %s@%s -> ss%d\n", a->file, a->name, a->target_ssid);
+            }
+        }
+    }
+    repq_inc(-1);
+    free(a);
+    return NULL;
+}
+
+static void schedule_checkpoint_repl(const char *file, const char *name, int primary_ssid, int target_ssid) {
+    repl_cp_args_t *a = (repl_cp_args_t *)malloc(sizeof(*a)); if (!a) return;
+    snprintf(a->file, sizeof(a->file), "%s", file); snprintf(a->name, sizeof(a->name), "%s", name); a->primary_ssid = primary_ssid; a->target_ssid = target_ssid;
+    pthread_t th; repq_inc(1); pthread_create(&th, NULL, repl_checkpoint_thread, a); pthread_detach(th);
 }
 
 // Fire-and-forget simple command replicate (CREATE/DELETE/RENAME)
@@ -258,7 +309,40 @@ static void *client_thread(void *arg) {
                 char files[512][128]; int ps[512]; size_t n = nm_state_get_dir(files, ps, 512);
                 for (size_t i=0;i<n;i++) {
                     int repls[16]; size_t nr = nm_state_get_replicas(files[i], repls, 16);
-                    for (size_t j=0;j<nr;j++) if (repls[j]==ssId) { schedule_put_repl(files[i], ps[i], ssId); }
+                    for (size_t j=0;j<nr;j++) if (repls[j]==ssId) {
+                        // Resync file content
+                        schedule_put_repl(files[i], ps[i], ssId);
+                        // Best-effort: also resync checkpoints list and push each
+                        // Fetch checkpoint names from primary
+                        int pport=0; char paddr[64];
+                        if (get_ss_info(ps[i], &pport, paddr, sizeof(paddr)) == 0 && pport) {
+                            char ticket[256]; if (ticket_build(files[i], "LISTCHECKPOINTS", ps[i], 600, ticket, sizeof(ticket)) == 0) {
+                                int sfd = tcp_connect(paddr, (uint16_t)pport);
+                                if (sfd >= 0) {
+                                    char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "LISTCHECKPOINTS", 1); json_put_string_field(req, sizeof(req), "file", files[i], 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                                    if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
+                                        char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) == 0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                            // Parse simple list of checkpoint names
+                                            const char *p = strchr(r, '['); if (p) {
+                                                p++;
+                                                while (*p && *p!=']') {
+                                                    while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                                                    if (*p=='"') {
+                                                        p++; const char *s=p; while(*p && *p!='"') p++; size_t nlen=(size_t)(p-s);
+                                                        char name[256]; if (nlen>=sizeof(name)) nlen=sizeof(name)-1; memcpy(name, s, nlen); name[nlen]='\0';
+                                                        if (*p=='"') p++;
+                                                        schedule_checkpoint_repl(files[i], name, ps[i], ssId);
+                                                    } else break;
+                                                }
+                                            }
+                                        }
+                                        if (r) free(r);
+                                    }
+                                    close(sfd);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             const char *resp = "{\"status\":\"OK\"}"; send_msg(fd, resp, (uint32_t)strlen(resp));
@@ -269,6 +353,20 @@ static void *client_thread(void *arg) {
                 int primary=0; if (nm_state_find_dir(file, &primary)==0 && primary==ssId) {
                     int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
                     for (size_t i=0;i<nr;i++) schedule_put_repl(file, primary, repls[i]);
+                }
+                const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
+            }
+        } else if (strcmp(type, "SS_CHECKPOINT") == 0) {
+            // Primary created a checkpoint; replicate it to replicas
+            char file[128]; char name[256]; int ssId=0;
+            int okf = (json_get_string_field(buf, "file", file, sizeof(file))==0);
+            (void)json_get_string_field(buf, "name", name, sizeof(name));
+            (void)json_get_int_field(buf, "ssId", &ssId);
+            if (!okf || !name[0] || ssId==0) { const char *er="{\"status\":\"ERR_BADREQ\"}"; send_msg(fd, er, (uint32_t)strlen(er)); }
+            else {
+                int primary=0; if (nm_state_find_dir(file, &primary)==0 && primary==ssId) {
+                    int repls[16]; size_t nr = nm_state_get_replicas(file, repls, 16);
+                    for (size_t i=0;i<nr;i++) schedule_checkpoint_repl(file, name, primary, repls[i]);
                 }
                 const char *ok="{\"status\":\"OK\"}"; send_msg(fd, ok, (uint32_t)strlen(ok));
             }

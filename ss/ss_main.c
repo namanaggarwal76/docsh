@@ -497,8 +497,34 @@ static void *ss_conn_handler(void *varg) {
                         char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
                         ensure_parent_dirs_for(cpath);
                         FILE *f = fopen(cpath, "wb"); if (!f) { free(cur); const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
-                        else { fwrite(cur, 1, clen, f); fflush(f); fclose(f); free(cur); const char *ok="{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
+                        else { fwrite(cur, 1, clen, f); fflush(f); fclose(f); free(cur); const char *ok="{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok));
+                            // Notify NM about checkpoint for replication
+                            int nfd = tcp_connect(g_nm_host[0]?g_nm_host:"127.0.0.1", g_nm_port);
+                            if (nfd >= 0) {
+                                char note[512]; note[0]='\0';
+                                json_put_string_field(note, sizeof(note), "type", "SS_CHECKPOINT", 1);
+                                json_put_string_field(note, sizeof(note), "file", file, 0);
+                                json_put_string_field(note, sizeof(note), "name", name, 0);
+                                json_put_int_field(note, sizeof(note), "ssId", g_ss_id, 0);
+                                strncat(note, "}", sizeof(note)-strlen(note)-1);
+                                (void)send_msg(nfd, note, (uint32_t)strlen(note)); char *nr=NULL; uint32_t nrl=0; (void)recv_msg(nfd, &nr, &nrl); if (nr) free(nr); close(nfd);
+                            }
+                        }
                     }
+                }
+            } else if (strcmp(type, "PUT_CHECKPOINT") == 0) {
+                // Internal replication endpoint: write provided body to a checkpoint file
+                char file[128]; char name[256]; char body[8192]; body[0]='\0';
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okn = (json_get_string_field(buf, "name", name, sizeof(name)) == 0);
+                int okb = (json_get_string_field(buf, "body", body, sizeof(body)) == 0);
+                if (!okf || !okn || !okb || !name[0]) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char cpath[SS_PATH_MAX]; snprintf(cpath, sizeof(cpath), "%s/checkpoints/%s/%s.chk", g_store_root, file, name);
+                    ensure_parent_dirs_for(cpath);
+                    FILE *f = fopen(cpath, "wb");
+                    if (!f) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                    else { fwrite(body, 1, strlen(body), f); fflush(f); fclose(f); const char *ok = "{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
                 }
             } else if (strcmp(type, "LISTCHECKPOINTS") == 0) {
                 char file[128]; char ticket[256];
