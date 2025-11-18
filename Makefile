@@ -38,7 +38,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(INC) -c $< -o $@
 
 clean:
-	rm -rf $(BUILD_DIR) $(BIN_DIR) data/ nm_state.json
+	rm -rf $(BUILD_DIR) $(BIN_DIR) ss_data/ nm_state.json
 
 dirs:
 	@mkdir -p $(BIN_DIR) $(BUILD_DIR)

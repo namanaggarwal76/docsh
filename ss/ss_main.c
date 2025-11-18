@@ -357,7 +357,61 @@ static void *ss_conn_handler(void *varg) {
             } else if (strcmp(type, "END_WRITE") == 0) {
                 if (!ws.active) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                 else {
-                    char *new_text = ss_tokens_compose(&ws.doc);
+                    // Merge-on-commit: re-read current file and replace only the target sentence with ws.doc's target sentence
+                    char *new_text = NULL;
+                    do {
+                        char path_cur[SS_PATH_MAX]; snprintf(path_cur, sizeof(path_cur), "%s/files/%s", g_store_root, ws.file);
+                        char *cur_content = NULL; size_t cur_len = 0;
+                        ss_doc_tokens_t cur_doc; memset(&cur_doc, 0, sizeof(cur_doc));
+                        int have_cur = (read_file_into(path_cur, &cur_content, &cur_len) == 0 && ss_tokenize(cur_content ? cur_content : "", &cur_doc) == 0);
+                        if (cur_content) free(cur_content);
+
+                        if (!have_cur) {
+                            // Fallback: start from the session doc (legacy behavior)
+                            new_text = ss_tokens_compose(&ws.doc);
+                            break;
+                        }
+
+                        int sidx = ws.sentence_idx;
+                        // Ensure cur_doc has enough sentences to hold sidx
+                        if (sidx < 0) { ss_tokens_free(&cur_doc); break; }
+                        if (sidx >= cur_doc.num_sentences) {
+                            int needed = sidx + 1;
+                            int old = cur_doc.num_sentences;
+                            // Grow arrays
+                            char ***sw = (char ***)realloc(cur_doc.sent_words, (size_t)needed * sizeof(char **));
+                            int *wc = (int *)realloc(cur_doc.word_counts, (size_t)needed * sizeof(int));
+                            if (!sw || !wc) { ss_tokens_free(&cur_doc); break; }
+                            cur_doc.sent_words = sw; cur_doc.word_counts = wc;
+                            for (int i = old; i < needed; ++i) { cur_doc.sent_words[i] = NULL; cur_doc.word_counts[i] = 0; }
+                            cur_doc.num_sentences = needed;
+                        }
+                        // Replace sentence sidx in cur_doc with deep copy from ws.doc
+                        // Free existing tokens in target sentence
+                        for (int j = 0; j < cur_doc.word_counts[sidx]; ++j) free(cur_doc.sent_words[sidx][j]);
+                        free(cur_doc.sent_words[sidx]);
+                        // Duplicate from ws.doc
+                        int wc2 = (sidx < ws.doc.num_sentences) ? ws.doc.word_counts[sidx] : 0;
+                        char **row = NULL;
+                        if (wc2 > 0) {
+                            row = (char **)malloc((size_t)wc2 * sizeof(char *));
+                            if (!row) { ss_tokens_free(&cur_doc); break; }
+                            for (int j = 0; j < wc2; ++j) {
+                                const char *srcw = ws.doc.sent_words[sidx][j];
+                                size_t ln = strlen(srcw);
+                                row[j] = (char *)malloc(ln + 1);
+                                if (!row[j]) { for (int k=0;k<j;k++) free(row[k]); free(row); ss_tokens_free(&cur_doc); row=NULL; break; }
+                                memcpy(row[j], srcw, ln + 1);
+                            }
+                            if (!row) break;
+                        }
+                        cur_doc.sent_words[sidx] = row;
+                        cur_doc.word_counts[sidx] = wc2;
+
+                        new_text = ss_tokens_compose(&cur_doc);
+                        ss_tokens_free(&cur_doc);
+                    } while (0);
+
                     fprintf(stderr, "[SS] END_WRITE composing: %s\n", new_text?new_text:"(null)"); fflush(stderr);
                     if (!new_text) { const char *resp = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
                     else {

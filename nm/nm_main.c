@@ -66,6 +66,30 @@ static int g_replication_queue = 0; // pending/in-flight tasks
 static void repq_inc(int delta) { pthread_mutex_lock(&g_rep_mu); g_replication_queue += delta; if (g_replication_queue < 0) g_replication_queue = 0; pthread_mutex_unlock(&g_rep_mu); }
 static int repq_get(void) { pthread_mutex_lock(&g_rep_mu); int v = g_replication_queue; pthread_mutex_unlock(&g_rep_mu); return v; }
 
+// Minimal JSON string unescape for EXEC script bodies
+static void json_unescape_inplace(char *str) {
+    if (!str) return;
+    char *src = str, *dst = str;
+    while (*src) {
+        if (*src == '\\') {
+            src++;
+            if (!*src) break;
+            switch (*src) {
+                case 'n': *dst++ = '\n'; break;
+                case 'r': *dst++ = '\r'; break;
+                case 't': *dst++ = '\t'; break;
+                case '\\': *dst++ = '\\'; break;
+                case '"': *dst++ = '"'; break;
+                default:   *dst++ = *src; break;
+            }
+            src++;
+        } else {
+            *dst++ = *src++;
+        }
+    }
+    *dst = '\0';
+}
+
 // Helper: fetch whole file text from a given SS (by ssid) using READ ticket
 static int fetch_file_from_ss(const char *file, int ssid, char *out_body, size_t out_sz) {
     int data_port = 0; char ss_addr[64];
@@ -1271,7 +1295,10 @@ static void *client_thread(void *arg) {
                                 else {
                                     char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) != 0 || !r || !strstr(r, "\"status\":\"OK\"")) { if (r) { send_msg(fd, r, rl); free(r);} else { const char *er = "{\"status\":\"ERR_UNAVAILABLE\"}"; send_msg(fd, er, (uint32_t)strlen(er)); } close(sfd); }
                                     else {
-                                        char body[8192]; body[0]='\0'; (void)json_get_string_field(r, "body", body, sizeof(body)); free(r); close(sfd);
+                                        char body[8192]; body[0]='\0'; (void)json_get_string_field(r, "body", body, sizeof(body));
+                                        // Convert JSON escapes (\\n, \\t, etc.) to real characters so /bin/sh sees proper lines
+                                        json_unescape_inplace(body);
+                                        free(r); close(sfd);
                                         // Find first available SS data folder for execution context
                                         char exec_dir[512]; exec_dir[0]='\0';
                                         pthread_mutex_lock(&g_mu);
