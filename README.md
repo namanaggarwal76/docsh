@@ -1,235 +1,809 @@
-[![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/0ek2UV58)
+# DOCS+
 
-# Docs++ (Course Project)
+**Course Project for OSN (Monsoon 2025)**
 
-This repository implements a Docs++ system with three components:
-- Name Manager (NM): routing, ACL enforcement, replication orchestration, persistence
-- Storage Server (SS): file storage, sentence-level WRITE with atomic commits, UNDO, checkpoints
-- Client (CLI): interactive shell with user-aware authorization
+**Team members: Naman Aggarwal(2024101018), Manav Beriwal(2024101105)**
 
-Build
+## 1️⃣ Project Overview
 
-```bash
-make -s all
+**Docs++** is a distributed, multi-user document editing system built from scratch in C. It provides **sentence-level collaborative editing** with concurrent writes, access control, undo/redo via checkpoints, and transparent replication across multiple storage servers.
+
+### Key Design Decisions
+
+- **Sentence-Level Editing**: Documents split on sentence delimiters (`.`, `!`, `?`). Each sentence can be locked and edited independently.
+- **Ticket-Based Authorization**: NM issues short-lived, signed tickets (file + operation + ssID). SS validates tickets to prevent unauthorized access.
+- **Replication**: Each file is assigned a primary SS and one replicas. Commits trigger async replication via NM.
+- **Merge-on-Commit**: When committing a sentence, SS re-reads the current file and merges only the edited sentence, preserving concurrent writes to other sentences.
+
+---
+
+## 2️⃣ System Architecture
+
+### 2.1 Components
+
+#### Name Server (NM)
+- **Role**: Routing, ACL enforcement, user session management, replication orchestration, persistence.
+- **State**: `nm_state.json` stores:
+  - File → primary SS mapping
+  - File → replica SS list
+  - File → owner + ACL (user permissions: R, W, RW)
+  - Active/inactive user sessions
+  - Access requests (pending approval)
+  - Logical folder hierarchy
+  - Trash metadata (soft-deleted files)
+- **Threading**: One pthread per client connection; shared state protected by mutexes.
+- **Heartbeat Monitor**: Background thread marks SS down after 6s without heartbeat; promotes replicas on primary failure.
+
+#### Storage Server (SS)
+- **Role**: Persistent storage, sentence tokenization, write locks, UNDO snapshots, checkpoints.
+- **Data Layout** (per SS instance):
+  ```
+  ss_data/ss<ID>/
+    files/         ← current file contents
+    undo/          ← single-level undo snapshots
+    checkpoints/   ← named checkpoint files per file
+  ```
+- **Threading**: One pthread per client connection; global lock table protected by mutex.
+- **Write Session**: Stateful; holds lock + in-memory doc until END_WRITE.
+
+#### Client (CLI)
+- **Interactive Shell**: Command history (arrow keys), tab-free user prompt.
+- **Features**: Human-readable output (no raw JSON); colorized OK/ERROR (green/red); table formatting for lists.
+
+### 2.2 Communication
+
+- **Protocol**: Length-prefixed JSON over TCP.
+  - Each message: `[4-byte big-endian length][JSON payload]`
+  - Blocking I/O with `send_msg` / `recv_msg` wrappers.
+- **Message Types**:
+  - Client ↔ NM: `CREATE`, `DELETE`, `LOOKUP`, `RENAME`, `VIEWFOLDER`, `ADDACCESS`, `LISTTRASH`, etc.
+  - NM ↔ SS: `SS_REGISTER`, `SS_HEARTBEAT`, `SS_COMMIT`, `SS_CHECKPOINT`, replication commands (`PUT`, `PUT_CHECKPOINT`).
+  - Client ↔ SS (after LOOKUP): `READ`, `WRITE`, `UNDO`, `CHECKPOINT`, `REVERT`, `STREAM`, `INFO`.
+- **Error Codes**: Standardized across NM/SS:
+  - `OK`, `ERR_NOAUTH`, `ERR_NOTFOUND`, `ERR_LOCKED`, `ERR_CONFLICT`, `ERR_UNAVAILABLE`, `ERR_BADREQ`, `ERR_INTERNAL`.
+
+### 2.3 High-Level Flow Diagram
+
+```
+Client                 Name Server (NM)          SS (Primary)              SS (Replica)
+   │                           │                      │                         │
+   │── CREATE ───────────────> │                      │                         │
+   │                           │── pick least-loaded ─────────────────────────> │
+   │                           │<────────────── OK ─────────────────────────────│
+   │                           ├─ schedule CREATE replica ─────────────────────>│
+   │<─────────────── OK ───────│                      │                         │
+   │                           │                      │                         │
+   │───────── WRITE ─────────> │                      │                         │
+   │                           ├─ ACL check + issue ticket ────────────────────>│
+   │<── ticket + SS address ───│                      │                         │
+   │                           │                      │                         │
+   │── BEGIN_WRITE(ticket) ─────────────────────────> │                         │
+   │<────────── OK (lock acquired) ───────────────────│                         │
+   │── APPLY (word/sentence updates) ────────────────>│                         │
+   │── END_WRITE ────────────────────────────────────>│                         │
+   │                           │<── SS_COMMIT notify ───────────────────────────│
+   │                           ├─ schedule PUT replica ────────────────────────>│
+   │<────────── OK (committed) ───────────────────────│                         │
+   │                           │                      │                         │
+
 ```
 
-## Run (one NM, two SS)
+---
 
-### Single machine (localhost):
+## 3️⃣ Design Decisions
+
+### 3.1 Sentence Representation
+
+- **Tokenization**:
+  - Sentences end at `.`, `!`, `?` (delimiter attached to last word).
+  - Words separated by whitespace.
+  - In-memory: `ss_doc_tokens_t` → array of sentence arrays of word strings.
+  - On-disk: plain text. 
+
+### 3.2 Locking for Concurrency
+
+- **Sentence-Level Locks** (SS-side):
+  - Lock entry: `(file, sentenceIndex)`.
+  - Lock lifecycle: `BEGIN_WRITE` acquires → `APPLY` modifies → `END_WRITE` commits & releases.
+  - Multiple readers: allowed concurrently (READ doesn't lock, readers see the latest snapshot of the file)
+  - Exclusive writes: only one writer per sentence at a time; others get `ERR_LOCKED`.
+- **Global Lock Table**: Protected by mutex; no deadlocks (single resource per session).
+
+### 3.3 Undo Implementation
+
+- **Single-Level UNDO** per file:
+  - Stored: `ss_data/ss<ID>/undo/<file>.undo`
+  - Captured: Before first commit after file creation or prior UNDO.
+  - Mechanism: At `END_WRITE`, SS saves the *pre-image* from the session's initial snapshot to `.undo`.
+  - Consumed: `UNDO` command swaps current file with undo snapshot and deletes `.undo`.
+- **Limitation**: Only one UNDO available; successive UNDOs won't revert further back (unless using checkpoints).
+
+### 3.4 Metadata Storage
+
+- **NM State** (`nm_state.json`):
+  - Directory: `file → (ss_id, owner, replicas, last_modified_user, last_accessed_user, timestamps)`
+  - ACLs: `file → user → perms`
+  - Folders: logical list of folder paths
+  - Trash: `file → (trash_path, ss_id, owner, when)`
+  - Requests: `file → [(user, mode), ...]`
+  - Users: active/inactive lists
+- **Persistence**: NM saves state after every mutation; SS uses atomic file ops.
+
+### 3.5 Threading Model
+
+- **NM**:
+  - Main thread: accepts client connections.
+  - Per-client thread: handles requests.
+  - Heartbeat monitor thread: checks SS liveness; promotes replicas on failure.
+  - Replication threads: PUT/PUT_CHECKPOINT to replicas.
+- **SS**:
+  - Main thread: binds data port.
+  - Data server thread: accepts connections.
+  - Per-connection thread: handles WRITE sessions.
+  - Heartbeat thread: periodic ping to NM.
+---
+
+## 4️⃣ Directory Structure
+
+```
+course-project-osint/
+├── client/
+│   └── cli_main.c              # Interactive CLI with REPL, command parsing, human-readable output
+├── nm/
+│   ├── nm_main.c               # Main server loop, routing, replication orchestration
+│   ├── nm_persist.c / .h       # JSON state save/load, ACL logic
+│   └── nm_dir.c / .h           # File-to-SS mapping, folder management
+├── ss/
+│   ├── ss_main.c               # Data server, WRITE sessions, locks, UNDO, checkpoints
+│   └── ss_tokenize.c / .h      # Sentence/word tokenization helpers
+├── common/
+│   ├── net_proto.c / .h        # send_msg/recv_msg, tcp_listen/tcp_connect, JSON helpers
+│   └── tickets.c / .h          # Ticket build/validate (HMAC-like signing)
+├── build/                      # .o object files (gitignored)
+├── bin/                        # Compiled binaries: nm, ss, client (gitignored)
+├── ss_data/                    # Per-SS data directories (created at runtime)
+│   ├── ss1/                    # Storage Server ID=1
+│   │   ├── files/
+│   │   ├── undo/
+│   │   └── checkpoints/
+│   └── ss2/                    # Storage Server ID=2
+│       └── ...
+│   └── ss3/                    # Storage Server ID=3
+│       └── ...
+├── nm_state.json               # NM persistent state (created at runtime)
+├── Makefile                    # Build system
+└── README.md                   # This file
+```
+
+**Explanation**:
+- **client/**: User-facing CLI; no state.
+- **nm/**: Name Server logic; state in `nm_state.json`.
+- **ss/**: Storage Server logic; state in `ss_data/ss<ID>/`.
+- **common/**: Shared networking, JSON, and ticket utilities.
+- **build/** and **bin/**: Generated during compilation.
+
+---
+
+## 5️⃣ Setup
+
+### Compilation
 
 ```bash
-# Terminal 1: Name Manager (NM)
+make all
+```
+
+This builds:
+- `bin/nm` (Name Server)
+- `bin/ss` (Storage Server)
+- `bin/client` (Client CLI)
+
+Clean build artifacts:
+```bash
+make clean
+```
+
+### Running the System
+
+#### Single Machine Setup
+
+**Terminal 1: Name Server**
+```bash
 ./bin/nm 5000
+```
 
-# Terminal 2: Storage Server #1 (id=1)
-./bin/ss 127.0.0.1 5000 6001 6002 1
+**Terminal 2: Storage Server #1**
+```bash
+./bin/ss 127.0.0.1 5000 6001 7001 1
+```
+- Args: `<nm_host> <nm_port> <ss_ctrl_port> <ss_data_port> [ss_id]`
+- `ss_id` defaults to `ss_ctrl_port` if omitted.
 
-# Terminal 3: Storage Server #2 (id=2)
-./bin/ss 127.0.0.1 5000 6003 6004 2
+**Terminal 3: Storage Server #2**
+```bash
+./bin/ss 127.0.0.1 5000 6002 7002 2
+```
 
-# Terminal 4: Client
+**Terminal 4: Client**
+```bash
 ./bin/client 127.0.0.1 5000
 ```
+- Connects to `127.0.0.1:5000` by default.
+- Prompts for username; enter a unique name. 
 
-### Multiple devices (network):
+#### Multiple Devices Setup
 
-**On the NM machine (e.g., IP 192.168.1.10):**
+Ensure all machines are on the same network or have routable IPs.
+
+**On NM machine (e.g., IP `a.b.c.d`)**:
 ```bash
 ./bin/nm 5000
 ```
 
-**On Storage Server machine 1 (any IP):**
+**On Storage Server machine 1**:
 ```bash
-# Use NM's IP address
-./bin/ss 192.168.1.10 5000 6001 6002 1
+./bin/ss a.b.c.d 5000 6001 7001 1
 ```
 
-**On Storage Server machine 2 (any IP):**
+**On Storage Server machine 2**:
 ```bash
-# Use NM's IP address
-./bin/ss 192.168.1.10 5000 6003 6004 2
+./bin/ss a.b.c.d 5000 6002 7002 2
 ```
 
-**On any client machine:**
+**On any client machine**:
 ```bash
-# Connect to NM's IP address
-./bin/client 192.168.1.10 5000
+./bin/client a.b.c.d 5000
 ```
+---
 
-**Notes:**
-- Storage Servers automatically register their IP address with the NM (extracted from the TCP connection)
-- Clients connect to the NM to get storage server addresses dynamically
-- No hardcoded localhost - the system works across networks
-- Ensure firewall rules allow TCP connections on the specified ports
-- The NM must be reachable from all SS and client machines
+## 6️⃣ How the System Works (Step-by-Step)
 
-## Final feature set (CLI)
+### 6.1 Client Startup & Registration
 
-- VIEW [-a] [-l]
-- READ <file>
-- CREATE <file> [-r] [-w] 
-- WRITE <file> <sentenceIndex>
-- UNDO <file>
-- INFO <file>
-- DELETE <file>
-- LISTTRASH
-- RESTORE <file>
-- EMPTYTRASH [<file>]
-- STREAM <file>
-- LIST (active users)
-- ADDACCESS -r|-w <file> <user>
-- REMACCESS <file> <user>
-- REQUEST_ACCESS <file> [-r|-w]
-- VIEWREQUESTS <file>
-- EXEC <file>
-- CREATEFOLDER <path>
-- VIEWFOLDER <path>
-- MOVE <src> <dst>
-- RENAME <old> <new>
-- CHECKPOINT <file> <name>
-- VIEWCHECKPOINT <file> <name>
-- LISTCHECKPOINTS <file>
-- REVERT <file> <checkpointName>
-- CLEAR
-- EXIT
+1. Client connects to NM on TCP port (default 5000).
+2. Sends `CLIENT_HELLO {user: "<username>"}`.
+3. NM checks if user is already active:
+   - If yes → `ERR_CONFLICT`.
+   - If no → mark user active, save state, reply `OK`.
+4. Client enters REPL loop; sends commands to NM.
 
-Notes
-- Sentence ends at '.', '!' or '?'. The delimiter stays attached to the last word.
-- WRITE uses sentence-level locks on the SS; concurrent writes to the same sentence are rejected with ERR_LOCKED.
-- Tickets are enforced end-to-end; NM performs ACL checks before issuing tickets.
-- UNDO is single-level per file: SS snapshots the pre-commit state on the first write after an UNDO (or creation) and consumes it when UNDO is executed.
-- Writes commit atomically via write-to-temp + rename.
+### 6.2 SS Startup & Registration
 
-## Quick test flows
+1. SS binds data port (e.g., 7001).
+2. Connects to NM and sends `SS_REGISTER {ssId: 1, ssCtrlPort: 6001, ssDataPort: 7001}`.
+3. NM extracts SS IP from socket peer address, registers entry.
+4. SS starts heartbeat thread → sends `SS_HEARTBEAT {ssId: 1}` every 2s.
+5. NM marks SS `is_up=1` if heartbeat within last 6s.
 
-Notes
-- Commands are case-insensitive; the canonical names above are what the client prints in `help`.
-- Sentence ends at '.', '!' or '?'. The delimiter stays attached to the last word.
-- WRITE uses sentence-level locks on the SS; concurrent writes to the same sentence are rejected with ERR_LOCKED.
-- Tickets are enforced end-to-end; NM performs ACL checks before issuing tickets.
-- UNDO is single-level per file: SS snapshots the pre-commit state on the first write after an UNDO (or creation) and consumes it when UNDO is executed.
-- Writes commit atomically via write-to-temp + rename.
+### 6.3 File Read Pipeline
 
-1) View and create
+**Command**: `READ demo.txt`
+
+1. Client → NM: `LOOKUP {op: "READ", file: "demo.txt", user: "alice"}`
+2. NM:
+   - Finds `demo.txt → ss_id=1`.
+   - Checks ACL: `alice` needs R permission.
+   - Builds ticket: `ticket_build("demo.txt", "READ", 1, 600, ...)` → signed string.
+   - Returns: `{status: "OK", ssAddr: "127.0.0.1", ssDataPort: 7001, ticket: "..."}`.
+3. Client → SS (7001): `READ {file: "demo.txt", ticket: "..."}`
+4. SS:
+   - Validates ticket: `ticket_validate(...)`.
+   - Reads `ss_data/ss1/files/demo.txt`.
+   - Returns: `{status: "OK", body: "Hello world. This is a demo."}`.
+5. Client prints body.
+
+**Metadata Update**: NM records `last_accessed_user="alice"` and `last_accessed_time=now`.
+
+### 6.4 File Write Pipeline (Sentence Locking)
+
+**Command**: `WRITE demo.txt 0`
+
+1. Client → NM: `LOOKUP {op: "WRITE", file: "demo.txt", user: "alice"}`
+2. NM:
+   - Checks ACL: `alice` needs W permission.
+   - Issues ticket for `WRITE` on SS 1.
+   - Returns ticket + SS address.
+3. Client → SS: `BEGIN_WRITE {file: "demo.txt", sentenceIndex: 0, ticket: "..."}`
+4. SS:
+   - Validates ticket.
+   - Tries to acquire lock on `(demo.txt, 0)`.
+   - If locked → `ERR_LOCKED`.
+   - If free → acquire lock, load file, tokenize, allocate in-memory session.
+   - Returns: `{status: "OK"}`.
+5. Client enters interactive edit mode:
+   - Prompts: `Enter <word_index> <content> lines; finish with ETIRW on its own line`
+   - User enters:
+     ```
+     0 Hello
+     1 world.
+     ETIRW
+     ```
+6. For each line (except `ETIRW`):
+   - Client → SS: `APPLY {wordIndex: 0, content: "Hello"}`
+   - SS: updates in-memory token array, returns `OK`.
+7. On `ETIRW`:
+   - Client → SS: `END_WRITE {}`
+8. SS:
+   - **Merge-on-commit**: Re-reads current file, tokenizes, replaces only sentence 0 with session's sentence 0.
+   - Saves undo snapshot (pre-image from session start) to `undo/demo.txt.undo`.
+   - Composes merged doc, writes to temp file, renames to `files/demo.txt`.
+   - Releases lock.
+   - Sends `SS_COMMIT {file: "demo.txt", ssId: 1}` to NM.
+   - Returns `OK` to client.
+9. NM (async):
+   - Fetches replicas for `demo.txt`.
+   - Spawns thread: reads file from primary via `READ` ticket, sends `PUT` to each replica.
+10. Client prints `OK`.
+
+**Metadata Update**: NM records `last_modified_user="alice"` and `last_modified_time=now`.
+
+**Concurrency**: If Bob tries `BEGIN_WRITE` on sentence 0 while Alice's session is active → `ERR_LOCKED`. Bob can edit sentence 1 concurrently.
+
+### 6.5 Undo Mechanism
+
+**Command**: `UNDO demo.txt`
+
+1. Client → NM: `LOOKUP {op: "UNDO", file: "demo.txt", user: "alice"}`
+2. NM: issues ticket for `UNDO` on primary SS.
+3. Client → SS: `UNDO {file: "demo.txt", ticket: "..."}`
+4. SS:
+   - Reads `undo/demo.txt.undo` (pre-commit snapshot).
+   - Writes snapshot to temp file, renames to `files/demo.txt`.
+   - Deletes `undo/demo.txt.undo` (consumes undo).
+   - Sends `SS_COMMIT` to NM (triggers replication).
+   - Returns `OK`.
+5. Client prints `OK`.
+
+**Limitation**: Only one undo level. After UNDO, the undo snapshot is gone. `CHECKPOINT` has multi-level history.
+
+### 6.6 Streaming (Word-by-Word)
+
+**Command**: `STREAM demo.txt`
+
+1. Client → NM: `LOOKUP {op: "READ", ...}` → get ticket.
+2. Client → SS: `STREAM {file: "demo.txt", ticket: "..."}`
+3. SS:
+   - Reads file, splits on whitespace into words.
+   - Sends frames: `{status: "OK", word: "Hello"}`, delay 0.1s, repeat.
+   - Final frame: `{status: "STOP"}`.
+4. Client prints each word as received, then newline on STOP.
+
+**When Server stops mid-stream, we get an error message specifying the same**.
+
+### 6.7 Execute Operation (NM-side Execution)
+
+**Command**: `EXEC script.sh`
+
+1. Client → NM: `LOOKUP {op: "READ", file: "script.sh", user: "alice"}`.
+2. NM → SS: issues ticket, fetches file content via `READ`.
+3. NM:
+   - Unescapes JSON body (converts `\n` to real newlines).
+   - Forks `/bin/sh -s`, pipes script to stdin.
+   - Reads stdout+stderr in chunks, sends to client as `{status: "OK", chunk: "..."}`.
+   - Final frame: `{status: "STOP", exit: <code>}`.
+4. Client prints streaming output, shows exit code if non-zero.
+
+**Security Note**: Script runs on NM machine, in NM's working directory (or optional chdir to `ss_data/ss1/files/`). No sandboxing. For production, restrict EXEC to trusted users.
+
+### 6.8 How NM Chooses SS
+
+- **File Creation**: NM picks the least-loaded SS (counts mappings per SS, chooses min).
+- **File Access**: NM looks up file → SS mapping in directory.
+- **Replication**: NM assigns one replica per file (picks next available SS != primary).
+
+**Simple least-loaded strategy.**
+
+---
+
+## 7️⃣ Supported Commands
+
+### Basic File Operations
+
+#### `VIEW [-a] [-l]`
+List files. Flags:
+- `-a`: Show all files (admin mode).
+- `-l`: Detailed view (table with words, chars, last access time, owner).
+
+**Example**:
 ```bash
 VIEW
-CREATE demo.txt -r
-READ demo.txt
-INFO demo.txt
+VIEW -l
 ```
 
-2) Write with locking
+#### `READ <file>`
+Print file contents.
+
+**Example**:
 ```bash
-WRITE demo.txt 0
-# enter lines like: 0 Hello world.
+READ demo.txt
+```
+
+#### `CREATE <file> [-r] [-w]`
+Create empty file. Flags:
+- `-r`: Public read (anyone can READ without ACL).
+- `-w`: Public write (anyone can WRITE).
+
+**Example**:
+```bash
+CREATE notes.txt
+CREATE public.txt -r -w
+```
+
+#### `DELETE <file>`
+Soft-delete file (moves to trash). Owner-only.
+
+**Example**:
+```bash
+DELETE notes.txt
+```
+
+#### `INFO <file>`
+Show file metadata: owner, size, words, last modified/accessed (with user/time).
+
+**Example**:
+```bash
+INFO notes.txt
+```
+
+### Writing & Editing
+
+#### `WRITE <file> <sentenceIndex>`
+Start interactive write session on a sentence. Prompts:
+```
+Enter <word_index> <content> lines; finish with ETIRW on its own line
+```
+
+**Example**:
+```bash
+WRITE notes.txt 0
+# Enter:
+0 This is the first sentence.
 ETIRW
-READ demo.txt
 ```
 
-3) Access control
+**Notes**:
+- `word_index` starts at 0 within the sentence.
+- Session holds a lock until `ETIRW`.
+
+#### `UNDO <file>`
+Revert to last snapshot before most recent write. Single-level.
+
+**Example**:
 ```bash
-ADDACCESS -r demo.txt bob
-REMACCESS demo.txt bob
-REQUEST_ACCESS demo.txt -r  # as a non-owner
-VIEWREQUESTS demo.txt       # as owner
+UNDO notes.txt
 ```
 
-4) Checkpoints and revert
+### Checkpoints & Versioning
+
+#### `CHECKPOINT <file> <name>`
+Save current file as a named checkpoint.
+
+**Example**:
 ```bash
-CHECKPOINT demo.txt snap1
-LISTCHECKPOINTS demo.txt
-VIEWCHECKPOINT demo.txt snap1
-REVERT demo.txt snap1      # name
-REVERT demo.txt snap1      # revert again (checkpoint only)
+CHECKPOINT notes.txt v1
 ```
 
-5) Folders and moves
+#### `LISTCHECKPOINTS <file>`
+List all checkpoint tags for file.
+
+**Example**:
+```bash
+LISTCHECKPOINTS notes.txt
+```
+
+#### `VIEWCHECKPOINT <file> <name>`
+Print checkpoint content (read-only).
+
+**Example**:
+```bash
+VIEWCHECKPOINT notes.txt v1
+```
+
+#### `REVERT <file> <checkpointName>`
+Restore file to checkpoint (overwrites current).
+
+**Example**:
+```bash
+REVERT notes.txt v1
+```
+
+### Folders & Rename/Move
+
+#### `CREATEFOLDER <path>`
+Create logical folder (no files yet).
+
+**Example**:
 ```bash
 CREATEFOLDER docs
-WRITE docs/note.txt 0
-ETIRW
-VIEWFOLDER docs
-MOVE docs/note.txt docs/notes.txt
-RENAME docs/notes.txt docs/todo.txt
+CREATEFOLDER docs/projects
 ```
 
-6) Execute scripts via NM (streaming output)
-```bash
-# Save a bash script into a file (via WRITE) and then execute it at the NM
-WRITE tools/diag.sh 0
-# enter lines:
-# echo "Running diagnostics..."
-# uname -a
-# ls -la
-# echo "Done!"
-ETIRW
+#### `VIEWFOLDER <path>`
+List files and folders in path.
 
-EXEC tools/diag.sh
-# Output streams live (stdout+stderr mixed) until completion; final line shows exit code if non-zero.
+**Example**:
+```bash
+VIEWFOLDER folder
 ```
 
-7) Trash can (soft delete)
-```bash
-# Delete moves the file to a hidden trash namespace on the SS and records it in NM state
-DELETE demo.txt
+#### `RENAME <old> <new>`
+Rename file (NM updates mapping; SS renames file + undo + checkpoints).
 
-# List trashed items
+**Example**:
+```bash
+RENAME old.txt new.txt
+```
+
+#### `MOVE <src> <dst>`
+Move file to folder or rename.
+
+**Example**:
+```bash
+MOVE notes.txt docs/notes.txt
+```
+
+### Trash Management
+
+#### `LISTTRASH`
+List all soft-deleted files (owner, trash path, timestamp).
+
+**Example**:
+```bash
 LISTTRASH
-
-# Restore a specific file (only the owner may restore)
-RESTORE demo.txt
-
-# Empty trash
-# - Without an argument: purge all trashed items owned by you
-# - With a file: purge only that file from trash
-EMPTYTRASH           # purge all your trashed files
-EMPTYTRASH demo.txt  # purge one file
 ```
 
-## Data locations
+#### `RESTORE <file>`
+Restore file from trash (owner-only).
 
-- Name Manager (NM) state: `nm_state.json` at repo root. It stores users, directory mapping, ACLs, replicas, folders, and pending requests.
-- Storage Server (SS) data: each SS writes under `ss_data/ss<ID>/` inside the repo:
-  - `files/` current file contents
-  - `undo/` single-level undo snapshots
-  - `checkpoints/` named checkpoints per file
-  - `meta/` reserved
+**Example**:
+```bash
+RESTORE notes.txt
+```
 
-You can run multiple SS from the same working directory; their data is kept separate by `ss<ID>`.
+#### `EMPTYTRASH [<file>]`
+Permanently delete trashed files. Without arg: purge all owned by you. With arg: purge specific file.
 
-## Error messages and common causes
+**Example**:
+```bash
+EMPTYTRASH
+EMPTYTRASH notes.txt
+```
 
-The client prints human-readable errors and does not dump raw JSON. Some errors include extra details from the server (msg).
+### Access Control
 
-- ERROR: resource not found
-  - Causes: file doesn’t exist; checkpoint/tag not found; undo snapshot missing.
-- ERROR: permission denied
-  - Causes: you don’t have R/W access; request access or ask the owner; invalid/expired ticket.
-- ERROR: conflict
-  - Causes: creating a file that already exists; renaming to an existing target; conflicting operation.
-- ERROR: sentence locked by another writer; try again later
-  - Causes: another WRITE session holds a lock on the same sentence index.
-- ERROR: service unavailable (no storage server reachable)
-  - Causes: no SS registered or reachable; NM couldn’t map the file to a live SS.
-- ERROR: bad request (invalid arguments/index or wrong sequence)
-  - Causes: missing fields, non-numeric or out-of-range indices, APPLY without an active session, or other invalid input.
-  - Details may include: missing-fields, invalid-index-or-content, session-active.
-- ERROR: internal server error (I/O failure or unexpected state)
-  - Causes: filesystem errors (permissions, disk), rename/write failures, or unhandled server-side conditions.
-- Network/transport errors
-  - Examples: failed to connect/send/receive to NM/SS. Usually indicates the service is down or a transient network issue.
+#### `ADDACCESS -r|-w <file> <user>`
+Grant access. Modes:
+- `-r`: Read-only.
+- `-w`: Read+Write.
 
-## Colorized terminal output
+**Example**:
+```bash
+ADDACCESS -r notes.txt bob
+ADDACCESS -w notes.txt alice
+```
 
-The client prints colored output when stdout is a TTY:
-- Green OK on success
-- Red ERROR on failures
-- Cyan section headers (e.g., requests)
+#### `REMACCESS <file> <user>`
+Revoke all access for user.
 
-Set NO_COLOR=1 to disable colors (or when piping output).
+**Example**:
+```bash
+REMACCESS notes.txt bob
+```
 
-## Replication and failover (overview)
+#### `REQUEST_ACCESS <file> [-r|-w]`
+Submit access request (non-owners). Owner sees via `VIEWREQUESTS`.
 
-- NM tracks SS heartbeats. If a primary goes down, a live replica is promoted and the old primary is kept as a replica for later resync.
-- On commit, SS notifies NM; NM replicates the update asynchronously (non-blocking) via PUT to replicas.
-- When an SS comes back up, NM resynchronizes files where it is a replica.
+**Example**:
+```bash
+REQUEST_ACCESS notes.txt -r
+```
+
+#### `VIEWREQUESTS <file>`
+List pending access requests (owner-only).
+
+**Example**:
+```bash
+VIEWREQUESTS notes.txt
+```
+
+### User Management
+
+#### `LIST`
+Show active and inactive users.
+
+**Example**:
+```bash
+LIST
+```
+
+### Streaming & Execution
+
+#### `STREAM <file>`
+Stream file word-by-word (0.1s delay between words).
+
+**Example**:
+```bash
+STREAM story.txt
+```
+
+#### `EXEC <file>`
+Execute file as a shell script on NM. Output streams live; final line shows exit code.
+
+**Example**:
+```bash
+EXEC tools/diag.sh
+```
+
+### Utility
+
+#### `CLEAR`
+Clear terminal screen (ANSI escape).
+
+#### `EXIT` 
+Log out and exit client.
+
+---
+
+## 8️⃣ Persistence
+
+### Name Server State
+
+- **File**: `nm_state.json` (JSON format, human-readable).
+- **Saved**: After every mutation (create, delete, ACL change, user login/logout, replication metadata).
+- **Loaded**: On startup; if missing, starts with empty state.
+
+### Storage Server Data
+
+- **Files**: `ss_data/ss<ID>/files/<path>` (plain text).
+- **Undo**: `ss_data/ss<ID>/undo/<path>.undo` (single snapshot).
+- **Checkpoints**: `ss_data/ss<ID>/checkpoints/<path>/<name>.chk` (multiple named snapshots).
+- **Atomic Writes**: Temp file → rename.
+- **Survives Restart**: All data persists; SS does not reload state from NM (stateless for directory mapping).
+
+### Replication
+
+- **NM tracks replicas** in `nm_state.json`.
+- **Async replication**: NM spawns thread on `SS_COMMIT` notification; fetches file from primary, sends `PUT` to replicas.
+- **Checkpoint replication**: On `SS_CHECKPOINT` notification, NM fetches checkpoint from primary via `VIEWCHECKPOINT`, sends `PUT_CHECKPOINT` to replicas.
+- **Resync on SS UP**: When SS heartbeat transitions from down to up, NM:
+  - Replicates current file content (for files where SS is a replica).
+  - Replicates undo snapshot (if exists on primary).
+  - Fetches checkpoint list from primary and replicates each checkpoint.
+
+---
+
+## 9️⃣ Caching & Efficient Search
+
+#### Hash Map Implementation
+
+All NM data structures use **custom hash maps** with chaining for **O(1) average-case lookups**:
+
+- **Hash Function**: DJB2 algorithm (`hash = ((hash << 5) + hash) + c`) with 256 buckets
+- **Collision Resolution**: Separate chaining with linked lists
+- **Data Structures Optimized**:
+  1. **Users**: `user_hash_node_t` - maps username → active status (O(1) login check)
+  2. **ACLs**: `acl_hash_node_t` - maps filename → ACL entry index (O(1) permission check)
+  3. **Folders**: `folder_hash_node_t` - maps folder path → index (O(1) existence check)
+  4. **Requests**: `req_hash_node_t` - maps filename → request entry index (O(1) request lookup)
+  5. **Trash**: `trash_hash_node_t` - maps filename → trash entry index (O(1) restore/purge)
+  6. **Directory**: `nm_dir.c` with 257-bucket hash map + 64-entry LRU cache (O(1) for LRU and hash access)
+
+#### Complexity Analysis
+- File lookup: **O(1)** average, O(n) worst (hash collision chain)
+- ACL check: **O(1)** average - hash map to ACL index, then O(g)
+- User active check: **O(1)** average - direct hash map lookup
+- Folder exists: **O(1)** average - hash map lookup
+- Request lookup: **O(1)** average - hash map to request index
+- Trash find: **O(1)** average - hash map to trash index
+
+**Trade-offs**:
+- Memory overhead: ~8KB for hash map buckets (256 buckets × 5 maps × 8 bytes/pointer)
+- Index maintenance: On delete, must update hash maps when swapping array elements
+- Collision handling: Uses chaining; average chain length < 2 for typical workloads (< 1000 entries)
+
+#### LRU Cache for Directory Lookups
+
+The directory mapping (`nm_dir.c`) implements a **2-tier lookup**:
+1. **LRU Cache** (64 entries, doubly-linked list): Stores most recently accessed file mappings
+2. **Hash Map** (257 buckets): Full directory index
+
+**Workflow**:
+- Lookup: Check LRU → if miss, check hash map → promote to LRU head
+- Insert: Update hash map → update/insert LRU (evict tail if > 64 entries)
+- Delete: Remove from both hash map and LRU
+
+### SS Lookup
+
+- **Lock Table**: Linked list; **O(n)** scan (n = number of active locks, typically < 100)
+  - Trade-off: Simple implementation; locks are short-lived (milliseconds to seconds)
+
+---
+
+## 1️⃣0️⃣ Logging
+
+### Log Format
+
+**NM**:
+```
+[NM] Registered SS id=1 ctrl=6001 data=7001 addr=127.0.0.1
+[NM] LOOKUP op=READ file=demo.txt have_op=1 have_file=1
+[NM] Replicated PUT demo.txt -> ss2
+[NM] Replicated CHECKPOINT demo.txt@v1 -> ss2
+```
+
+**SS**:
+```
+[SS] accept cfd=4
+[SS] recv 42 bytes: {"type":"READ","file":"demo.txt","ticket":"..."}
+[SS] type=READ
+[SS] CREATE file=demo.txt path=ss_data/ss1/files/demo.txt
+[SS] BEGIN_WRITE file=demo.txt okf=1 idxrc=0 sidx=0
+[SS] lock_acquire rc=0
+[SS] END_WRITE composing: Hello world.
+[SS] END_WRITE commit OK
+```
+
+### Colorized Output
+
+- **Client**:
+  - Green: `OK`
+  - Red: `ERROR`
+  - Cyan: Section headers (e.g., "Access Requests:")
+- **Disable**: `export NO_COLOR=1`
+
+---
+
+## 1️⃣1️⃣ Error Handling
+
+### Error Codes (Unified NM/SS)
+
+| Code                | Meaning                                      | Example Causes                                                                 |
+|---------------------|----------------------------------------------|-------------------------------------------------------------------------------|
+| `OK`                | Success                                      | -                                                                             |
+| `ERR_NOAUTH`        | Permission denied                            | ACL check failed; invalid/expired ticket                                       |
+| `ERR_NOTFOUND`      | Resource not found                           | File doesn't exist; checkpoint tag missing; undo snapshot missing              |
+| `ERR_LOCKED`        | Sentence locked by another writer            | Concurrent WRITE to same sentence                                              |
+| `ERR_CONFLICT`      | Name/state conflict                          | CREATE on existing file; RENAME to existing target; duplicate user login       |
+| `ERR_UNAVAILABLE`   | Service unavailable                          | No SS reachable; primary down and no replica; NM connection failed             |
+| `ERR_BADREQ`        | Bad request                                  | Missing fields; invalid indices; APPLY without active session; malformed JSON  |
+| `ERR_INTERNAL`      | Internal server error                        | I/O failure (permissions, disk full); unexpected state                         |
+
+
+---
+
+## 1️⃣2️⃣ Bonus Features
+
+### ✅ Folders
+
+- **Logical Hierarchy**: NM stores folder paths; no physical directories (except in SS data).
+- **Commands**: `CREATEFOLDER`, `VIEWFOLDER`, `MOVE` (supports folder destinations).
+- **Implementation**: NM maintains vector of folder strings; prefix-based filtering for children.
+
+### ✅ Checkpoints
+
+- **Named Snapshots**: Save current file as `<name>.chk` in `checkpoints/<file>/`.
+- **Commands**: `CHECKPOINT`, `LISTCHECKPOINTS`, `VIEWCHECKPOINT`, `REVERT`.
+- **Storage**: SS stores full file copy per checkpoint (no delta/diff).
+- **Replication**: Checkpoints replicated to replicas on creation; resynced on SS UP.
+
+### ✅ Access Request System
+
+- **Workflow**:
+  1. Non-owner runs `REQUEST_ACCESS <file> [-r|-w]`.
+  2. NM stores pending request.
+  3. Owner runs `VIEWREQUESTS <file>` → sees list.
+  4. Owner grants via `ADDACCESS` → removes request.
+- **No Auto-Approval**: Manual owner action required.
+
+### ✅ Replication
+
+- **1+1 Setup**: Each file assigned one primary + one replica (if available).
+- **Async PUT**: NM spawns thread on `SS_COMMIT`, fetches from primary, sends to replica(s).
+- **Failover**: Heartbeat monitor promotes replica on primary down.
+- **Checkpoint Replication**: On `SS_CHECKPOINT`, NM replicates checkpoint file to replicas.
+
+### ✅ Trash Can (Soft Delete)
+
+- **DELETE** moves file to `.trash/<timestamp>_<escaped_name>` on SS; NM records metadata.
+- **LISTTRASH** shows all trashed items (owner, timestamp).
+- **RESTORE** renames back from trash (owner-only).
+- **EMPTYTRASH** permanently deletes (hard unlink).

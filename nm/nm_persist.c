@@ -8,12 +8,60 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+// Hash table implementation for O(1) lookups
+#define HASH_BUCKETS 256
+
+static unsigned hash_djb2(const char *str) {
+    unsigned long hash = 5381;
+    int c;
+    while ((c = *str++))
+        hash = ((hash << 5) + hash) + c;
+    return hash % HASH_BUCKETS;
+}
+
 struct acl_user { char *user; int perm; };
+
+// Hash map structures for O(1) lookups
+typedef struct user_hash_node {
+    char *user;
+    int is_active;
+    struct user_hash_node *next;
+} user_hash_node_t;
+
+typedef struct acl_hash_node {
+    char *file;
+    size_t acl_index; // index into g_state.acls array
+    struct acl_hash_node *next;
+} acl_hash_node_t;
+
+typedef struct folder_hash_node {
+    char *path;
+    size_t folder_index; // index into g_state.folders array
+    struct folder_hash_node *next;
+} folder_hash_node_t;
+
+typedef struct req_hash_node {
+    char *file;
+    size_t req_index; // index into g_state.requests array
+    struct req_hash_node *next;
+} req_hash_node_t;
+
+typedef struct trash_hash_node {
+    char *file;
+    size_t trash_index; // index into g_state.trash array
+    struct trash_hash_node *next;
+} trash_hash_node_t;
 
 typedef struct {
     char **users;
     size_t n_users;
     size_t cap_users;
+    // Hash maps for O(1) lookups
+    user_hash_node_t *user_map[HASH_BUCKETS];
+    acl_hash_node_t *acl_map[HASH_BUCKETS];
+    folder_hash_node_t *folder_map[HASH_BUCKETS];
+    req_hash_node_t *req_map[HASH_BUCKETS];
+    trash_hash_node_t *trash_map[HASH_BUCKETS];
     // Active users (logged-in)
     char **active_users;
     size_t n_active;
@@ -71,18 +119,231 @@ static void ensure_active_cap(size_t need) {
 
 void nm_state_init(void) {
     memset(&g_state, 0, sizeof(g_state));
+    // Initialize hash maps
+    for (int i = 0; i < HASH_BUCKETS; i++) {
+        g_state.user_map[i] = NULL;
+        g_state.acl_map[i] = NULL;
+        g_state.folder_map[i] = NULL;
+        g_state.req_map[i] = NULL;
+        g_state.trash_map[i] = NULL;
+    }
 }
+
+// User hash map helpers
+static void user_map_insert(const char *user, int is_active) {
+    unsigned h = hash_djb2(user);
+    user_hash_node_t *node = (user_hash_node_t *)malloc(sizeof(user_hash_node_t));
+    node->user = strdup(user);
+    node->is_active = is_active;
+    node->next = g_state.user_map[h];
+    g_state.user_map[h] = node;
+}
+
+static user_hash_node_t *user_map_find(const char *user) {
+    unsigned h = hash_djb2(user);
+    user_hash_node_t *node = g_state.user_map[h];
+    while (node) {
+        if (strcmp(node->user, user) == 0) return node;
+        node = node->next;
+    }
+    return NULL;
+}
+
+// ACL hash map helpers
+static void acl_map_insert(const char *file, size_t index) {
+    unsigned h = hash_djb2(file);
+    acl_hash_node_t *node = (acl_hash_node_t *)malloc(sizeof(acl_hash_node_t));
+    node->file = strdup(file);
+    node->acl_index = index;
+    node->next = g_state.acl_map[h];
+    g_state.acl_map[h] = node;
+}
+
+static size_t acl_map_find(const char *file, int *found) {
+    unsigned h = hash_djb2(file);
+    acl_hash_node_t *node = g_state.acl_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            *found = 1;
+            return node->acl_index;
+        }
+        node = node->next;
+    }
+    *found = 0;
+    return 0;
+}
+
+static void acl_map_remove(const char *file) {
+    unsigned h = hash_djb2(file);
+    acl_hash_node_t *prev = NULL, *node = g_state.acl_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            if (prev) prev->next = node->next;
+            else g_state.acl_map[h] = node->next;
+            free(node->file);
+            free(node);
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
+static void acl_map_update_index(const char *file, size_t new_index) {
+    unsigned h = hash_djb2(file);
+    acl_hash_node_t *node = g_state.acl_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            node->acl_index = new_index;
+            return;
+        }
+        node = node->next;
+    }
+}
+
+// Folder hash map helpers
+static void folder_map_insert(const char *path, size_t index) {
+    unsigned h = hash_djb2(path);
+    folder_hash_node_t *node = (folder_hash_node_t *)malloc(sizeof(folder_hash_node_t));
+    node->path = strdup(path);
+    node->folder_index = index;
+    node->next = g_state.folder_map[h];
+    g_state.folder_map[h] = node;
+}
+
+static int folder_map_exists(const char *path) {
+    unsigned h = hash_djb2(path);
+    folder_hash_node_t *node = g_state.folder_map[h];
+    while (node) {
+        if (strcmp(node->path, path) == 0) return 1;
+        node = node->next;
+    }
+    return 0;
+}
+
+static void folder_map_remove(const char *path) {
+    unsigned h = hash_djb2(path);
+    folder_hash_node_t *prev = NULL, *node = g_state.folder_map[h];
+    while (node) {
+        if (strcmp(node->path, path) == 0) {
+            if (prev) prev->next = node->next;
+            else g_state.folder_map[h] = node->next;
+            free(node->path);
+            free(node);
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
+// Request hash map helpers
+static void req_map_insert(const char *file, size_t index) {
+    unsigned h = hash_djb2(file);
+    req_hash_node_t *node = (req_hash_node_t *)malloc(sizeof(req_hash_node_t));
+    node->file = strdup(file);
+    node->req_index = index;
+    node->next = g_state.req_map[h];
+    g_state.req_map[h] = node;
+}
+
+static size_t req_map_find(const char *file, int *found) {
+    unsigned h = hash_djb2(file);
+    req_hash_node_t *node = g_state.req_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            *found = 1;
+            return node->req_index;
+        }
+        node = node->next;
+    }
+    *found = 0;
+    return 0;
+}
+
+static void req_map_remove(const char *file) {
+    unsigned h = hash_djb2(file);
+    req_hash_node_t *prev = NULL, *node = g_state.req_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            if (prev) prev->next = node->next;
+            else g_state.req_map[h] = node->next;
+            free(node->file);
+            free(node);
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
+// Trash hash map helpers
+static void trash_map_insert(const char *file, size_t index) {
+    unsigned h = hash_djb2(file);
+    trash_hash_node_t *node = (trash_hash_node_t *)malloc(sizeof(trash_hash_node_t));
+    node->file = strdup(file);
+    node->trash_index = index;
+    node->next = g_state.trash_map[h];
+    g_state.trash_map[h] = node;
+}
+
+static size_t trash_map_find(const char *file, int *found) {
+    unsigned h = hash_djb2(file);
+    trash_hash_node_t *node = g_state.trash_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            *found = 1;
+            return node->trash_index;
+        }
+        node = node->next;
+    }
+    *found = 0;
+    return 0;
+}
+
+static void trash_map_remove(const char *file) {
+    unsigned h = hash_djb2(file);
+    trash_hash_node_t *prev = NULL, *node = g_state.trash_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            if (prev) prev->next = node->next;
+            else g_state.trash_map[h] = node->next;
+            free(node->file);
+            free(node);
+            return;
+        }
+        prev = node;
+        node = node->next;
+    }
+}
+
+static void trash_map_update_index(const char *file, size_t new_index) {
+    unsigned h = hash_djb2(file);
+    trash_hash_node_t *node = g_state.trash_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            node->trash_index = new_index;
+            return;
+        }
+        node = node->next;
+    }
+}
+
 
 int nm_state_add_user(const char *user) {
     if (!user || !*user) return 0;
-    for (size_t i = 0; i < g_state.n_users; ++i) {
-        if (strcmp(g_state.users[i], user) == 0) return 0;
-    }
+    // Check hash map first (O(1))
+    if (user_map_find(user)) return 0;
+    
+    // Add to array
     ensure_user_cap(g_state.n_users + 1);
     if (g_state.cap_users < g_state.n_users + 1) return 0; // failed to grow
     g_state.users[g_state.n_users] = strdup(user);
     if (!g_state.users[g_state.n_users]) return 0;
     g_state.n_users++;
+    
+    // Add to hash map
+    user_map_insert(user, 0);
     return 1;
 }
 
@@ -106,20 +367,32 @@ size_t nm_state_get_active_users(char users[][128], size_t max_users) {
 
 int nm_state_user_is_active(const char *user) {
     if (!user || !*user) return 0;
-    for (size_t i = 0; i < g_state.n_active; ++i) {
-        if (strcmp(g_state.active_users[i], user) == 0) return 1;
-    }
-    return 0;
+    // O(1) hash map lookup
+    user_hash_node_t *node = user_map_find(user);
+    return node ? node->is_active : 0;
 }
 
 int nm_state_set_user_active(const char *user, int active) {
     if (!user || !*user) return 0;
     // Ensure it's a known user when activating
     if (active) nm_state_add_user(user);
+    
+    // Update hash map (O(1))
+    user_hash_node_t *node = user_map_find(user);
+    if (!node) {
+        if (!active) return 0; // trying to deactivate non-existent user
+        // Add new user node
+        user_map_insert(user, 1);
+        node = user_map_find(user);
+    }
+    
+    if (node->is_active == active) return 0; // no change
+    node->is_active = active;
+    
     // Look for existing in active list
     for (size_t i = 0; i < g_state.n_active; ++i) {
         if (strcmp(g_state.active_users[i], user) == 0) {
-            if (active) return 0; // already active
+            if (active) return 0; // already active (shouldn't happen with hash map check)
             // deactivate: remove by swap-with-last
             free(g_state.active_users[i]);
             if (i + 1 < g_state.n_active) g_state.active_users[i] = g_state.active_users[g_state.n_active - 1];
@@ -640,41 +913,53 @@ static void ensure_trash_cap(size_t need) {
 int nm_state_trash_add(const char *file, const char *trashed_path, int ssid, const char *owner, int when) {
     if (!file || !*file || !trashed_path || !*trashed_path) return 0;
     // If exists, replace
-    for (size_t i=0;i<g_state.n_trash;i++) {
-        if (strcmp(g_state.trash[i].file, file)==0) {
-            if (g_state.trash[i].trashed) free(g_state.trash[i].trashed);
-            g_state.trash[i].trashed = strdup(trashed_path);
-            g_state.trash[i].ssid = ssid;
-            if (g_state.trash[i].owner) free(g_state.trash[i].owner);
-            g_state.trash[i].owner = owner && *owner ? strdup(owner) : NULL;
-            g_state.trash[i].when = when;
-            return 1;
-        }
+    int found = 0;
+    size_t index = trash_map_find(file, &found);
+    if (found && index < g_state.n_trash) {
+        struct trash_entry *e = &g_state.trash[index];
+        if (e->trashed) free(e->trashed);
+        e->trashed = strdup(trashed_path);
+        e->ssid = ssid;
+        if (e->owner) free(e->owner);
+        e->owner = owner && *owner ? strdup(owner) : NULL;
+        e->when = when;
+        return 1;
     }
     ensure_trash_cap(g_state.n_trash + 1);
     if (g_state.cap_trash < g_state.n_trash + 1) return 0;
-    struct trash_entry *e = &g_state.trash[g_state.n_trash++];
+    struct trash_entry *e = &g_state.trash[g_state.n_trash];
     e->file = strdup(file);
     e->trashed = strdup(trashed_path);
     e->ssid = ssid;
     e->owner = (owner && *owner) ? strdup(owner) : NULL;
     e->when = when;
+    // Add to hash map
+    trash_map_insert(file, g_state.n_trash);
+    g_state.n_trash++;
     return 1;
 }
 
 int nm_state_trash_remove(const char *file) {
     if (!file || !*file) return 0;
-    for (size_t i=0;i<g_state.n_trash;i++) {
-        if (strcmp(g_state.trash[i].file, file)==0) {
-            if (g_state.trash[i].file) free(g_state.trash[i].file);
-            if (g_state.trash[i].trashed) free(g_state.trash[i].trashed);
-            if (g_state.trash[i].owner) free(g_state.trash[i].owner);
-            if (i != g_state.n_trash-1) g_state.trash[i] = g_state.trash[g_state.n_trash-1];
-            g_state.n_trash--;
-            return 1;
-        }
+    int found = 0;
+    size_t index = trash_map_find(file, &found);
+    if (!found || index >= g_state.n_trash) return 0;
+    
+    struct trash_entry *e = &g_state.trash[index];
+    if (e->file) free(e->file);
+    if (e->trashed) free(e->trashed);
+    if (e->owner) free(e->owner);
+    
+    // Remove from hash map
+    trash_map_remove(file);
+    
+    if (index != g_state.n_trash-1) {
+        g_state.trash[index] = g_state.trash[g_state.n_trash-1];
+        // Update hash map for swapped element
+        trash_map_update_index(g_state.trash[index].file, index);
     }
-    return 0;
+    g_state.n_trash--;
+    return 1;
 }
 
 int nm_state_trash_find(const char *file, char *trashed_out, size_t trashed_out_sz, int *ssid_out, char *owner_out, size_t owner_out_sz, int *when_out) {
@@ -690,16 +975,18 @@ int nm_state_trash_find(const char *file, char *trashed_out, size_t trashed_out_
     if (when_out) {
         *when_out = 0;
     }
-    for (size_t i=0;i<g_state.n_trash;i++) {
-        if (strcmp(g_state.trash[i].file, file)==0) {
-            if (trashed_out && trashed_out_sz) snprintf(trashed_out, trashed_out_sz, "%s", g_state.trash[i].trashed?g_state.trash[i].trashed:"");
-            if (ssid_out) *ssid_out = g_state.trash[i].ssid;
-            if (owner_out && owner_out_sz) snprintf(owner_out, owner_out_sz, "%s", g_state.trash[i].owner?g_state.trash[i].owner:"");
-            if (when_out) *when_out = g_state.trash[i].when;
-            return 0;
-        }
-    }
-    return -1;
+    
+    // O(1) hash map lookup
+    int found = 0;
+    size_t index = trash_map_find(file, &found);
+    if (!found || index >= g_state.n_trash) return -1;
+    
+    struct trash_entry *e = &g_state.trash[index];
+    if (trashed_out && trashed_out_sz) snprintf(trashed_out, trashed_out_sz, "%s", e->trashed?e->trashed:"");
+    if (ssid_out) *ssid_out = e->ssid;
+    if (owner_out && owner_out_sz) snprintf(owner_out, owner_out_sz, "%s", e->owner?e->owner:"");
+    if (when_out) *when_out = e->when;
+    return 0;
 }
 
 size_t nm_state_get_trash(char files[][128], char trashed[][128], int ssids[], char owners[][128], int whens[], size_t max_entries) {
@@ -912,7 +1199,12 @@ static void ensure_acl_cap(size_t need){
 }
 
 static struct acl_entry* find_acl(const char *file){
-    for (size_t i=0;i<g_state.n_acls;i++){ if (strcmp(g_state.acls[i].file, file)==0) return &g_state.acls[i]; }
+    // O(1) hash map lookup
+    int found = 0;
+    size_t index = acl_map_find(file, &found);
+    if (found && index < g_state.n_acls) {
+        return &g_state.acls[index];
+    }
     return NULL;
 }
 
@@ -921,9 +1213,12 @@ static struct acl_entry* upsert_acl(const char *file){
     if (e) return e;
     ensure_acl_cap(g_state.n_acls+1);
     if (g_state.cap_acls < g_state.n_acls+1) return NULL;
-    e = &g_state.acls[g_state.n_acls++];
+    e = &g_state.acls[g_state.n_acls];
     memset(e, 0, sizeof(*e));
     e->file = strdup(file);
+    // Add to hash map
+    acl_map_insert(file, g_state.n_acls);
+    g_state.n_acls++;
     return e;
 }
 
@@ -965,20 +1260,27 @@ int nm_acl_revoke(const char *file, const char *user) {
 
 int nm_acl_delete(const char *file) {
     if (!file || !*file) return 0;
-    for (size_t i=0;i<g_state.n_acls;i++) {
-        if (strcmp(g_state.acls[i].file, file)==0) {
-            struct acl_entry *e = &g_state.acls[i];
-            if (e->owner) { free(e->owner); e->owner=NULL; }
-            for (size_t j=0;j<e->n_grants;j++) if (e->grants[j].user) free(e->grants[j].user);
-            if (e->grants) { free(e->grants); e->grants=NULL; }
-            if (e->file) { free(e->file); e->file=NULL; }
-            // swap with last
-            if (i != g_state.n_acls-1) g_state.acls[i] = g_state.acls[g_state.n_acls-1];
-            g_state.n_acls--;
-            return 1;
-        }
+    int found = 0;
+    size_t index = acl_map_find(file, &found);
+    if (!found || index >= g_state.n_acls) return 0;
+    
+    struct acl_entry *e = &g_state.acls[index];
+    if (e->owner) { free(e->owner); e->owner=NULL; }
+    for (size_t j=0;j<e->n_grants;j++) if (e->grants[j].user) free(e->grants[j].user);
+    if (e->grants) { free(e->grants); e->grants=NULL; }
+    if (e->file) { free(e->file); e->file=NULL; }
+    
+    // Remove from hash map
+    acl_map_remove(file);
+    
+    // swap with last and update hash map
+    if (index != g_state.n_acls-1) {
+        g_state.acls[index] = g_state.acls[g_state.n_acls-1];
+        // Update hash map for swapped element
+        acl_map_update_index(g_state.acls[index].file, index);
     }
-    return 0;
+    g_state.n_acls--;
+    return 1;
 }
 
 int nm_acl_check(const char *file, const char *user, const char *op) {
@@ -1056,10 +1358,8 @@ static void ensure_folder_cap(size_t need) {
 }
 
 static int folder_exists(const char *path) {
-    for (size_t i = 0; i < g_state.n_folders; ++i) {
-        if (strcmp(g_state.folders[i], path) == 0) return 1;
-    }
-    return 0;
+    // O(1) hash map lookup
+    return folder_map_exists(path);
 }
 
 int nm_state_add_folder(const char *path) {
@@ -1069,6 +1369,8 @@ int nm_state_add_folder(const char *path) {
     if (g_state.cap_folders < g_state.n_folders + 1) return 0;
     g_state.folders[g_state.n_folders] = strdup(path);
     if (!g_state.folders[g_state.n_folders]) return 0;
+    // Add to hash map
+    folder_map_insert(path, g_state.n_folders);
     g_state.n_folders++;
     return 1;
 }
@@ -1077,6 +1379,8 @@ int nm_state_remove_folder(const char *path) {
     if (!path || !*path) return 0;
     for (size_t i = 0; i < g_state.n_folders; ++i) {
         if (strcmp(g_state.folders[i], path) == 0) {
+            // Remove from hash map
+            folder_map_remove(path);
             free(g_state.folders[i]);
             if (i != g_state.n_folders - 1) g_state.folders[i] = g_state.folders[g_state.n_folders - 1];
             g_state.n_folders--;
@@ -1198,7 +1502,12 @@ static void ensure_req_cap(size_t need) {
 }
 
 static struct req_entry *find_req_entry(const char *file) {
-    for (size_t i=0;i<g_state.n_requests;i++) if (strcmp(g_state.requests[i].file, file)==0) return &g_state.requests[i];
+    // O(1) hash map lookup
+    int found = 0;
+    size_t index = req_map_find(file, &found);
+    if (found && index < g_state.n_requests) {
+        return &g_state.requests[index];
+    }
     return NULL;
 }
 
@@ -1209,9 +1518,12 @@ int nm_state_add_request(const char *file, const char *user, char mode) {
     if (!e) {
         ensure_req_cap(g_state.n_requests + 1);
         if (g_state.cap_requests < g_state.n_requests + 1) return 0;
-        e = &g_state.requests[g_state.n_requests++];
+        e = &g_state.requests[g_state.n_requests];
         memset(e, 0, sizeof(*e));
         e->file = strdup(file);
+        // Add to hash map
+        req_map_insert(file, g_state.n_requests);
+        g_state.n_requests++;
     }
     // check duplicate
     for (size_t i=0;i<e->n_users;i++) if (strcmp(e->users[i], user)==0) return 0;
@@ -1252,12 +1564,31 @@ int nm_state_remove_request(const char *file, const char *user) {
 int nm_state_clear_requests_for(const char *file) {
     struct req_entry *e = find_req_entry(file);
     if (!e) return 0;
+    
+    // Get index for swap-with-last
+    int found = 0;
+    size_t index = req_map_find(file, &found);
+    if (!found) return 0;
+    
     for (size_t i=0;i<e->n_users;i++) if (e->users[i]) free(e->users[i]);
     free(e->users); e->users=NULL; e->n_users=0; e->cap_users=0;
     if (e->modes) { free(e->modes); e->modes=NULL; }
+    
+    // Remove from hash map
+    req_map_remove(file);
+    
     // remove entry itself
     free(e->file);
-    if (e != &g_state.requests[g_state.n_requests-1]) *e = g_state.requests[g_state.n_requests-1];
+    if (e != &g_state.requests[g_state.n_requests-1]) {
+        *e = g_state.requests[g_state.n_requests-1];
+        // No need to update hash map here since we're not tracking indices for requests
+        // Actually we need to update if we're using indexed hash map
+        // Re-insert the swapped element's hash entry
+        if (index != g_state.n_requests - 1) {
+            req_map_remove(g_state.requests[index].file);
+            req_map_insert(g_state.requests[index].file, index);
+        }
+    }
     g_state.n_requests--;
     return 1;
 }

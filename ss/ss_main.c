@@ -95,7 +95,7 @@ static void *heartbeat_thread(void *arg) {
             char hb[128]; hb[0]='\0'; json_put_string_field(hb, sizeof(hb), "type", "SS_HEARTBEAT", 1); json_put_int_field(hb, sizeof(hb), "ssId", g_ss_id, 0); strncat(hb, "}", sizeof(hb)-strlen(hb)-1);
             (void)send_msg(hfd, hb, (uint32_t)strlen(hb)); char *hr=NULL; uint32_t hrl=0; (void)recv_msg(hfd, &hr, &hrl); if (hr) free(hr); close(hfd);
         }
-        sleep(2);
+        sleep(1);
     }
     return NULL;
 }
@@ -579,6 +579,19 @@ static void *ss_conn_handler(void *varg) {
                     FILE *f = fopen(cpath, "wb");
                     if (!f) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
                     else { fwrite(body, 1, strlen(body), f); fflush(f); fclose(f); const char *ok = "{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
+                }
+            } else if (strcmp(type, "PUT_UNDO") == 0) {
+                // Internal replication endpoint: write provided body to an undo file
+                char file[128]; char body[8192]; body[0]='\0';
+                int okf = (json_get_string_field(buf, "file", file, sizeof(file)) == 0);
+                int okb = (json_get_string_field(buf, "body", body, sizeof(body)) == 0);
+                if (!okf || !okb) { const char *resp = "{\"status\":\"ERR_BADREQ\"}"; send_msg(cfd, resp, (uint32_t)strlen(resp)); }
+                else {
+                    char upath[SS_PATH_MAX]; snprintf(upath, sizeof(upath), "%s/undo/%s.undo", g_store_root, file);
+                    ensure_parent_dirs_for(upath);
+                    FILE *f = fopen(upath, "wb");
+                    if (!f) { const char *er = "{\"status\":\"ERR_INTERNAL\"}"; send_msg(cfd, er, (uint32_t)strlen(er)); }
+                    else { fwrite(body, 1, strlen(body), f); fflush(f); fclose(f); fprintf(stderr, "[SS] PUT_UNDO saved: %s\n", upath); const char *ok = "{\"status\":\"OK\"}"; send_msg(cfd, ok, (uint32_t)strlen(ok)); }
                 }
             } else if (strcmp(type, "LISTCHECKPOINTS") == 0) {
                 char file[128]; char ticket[256];

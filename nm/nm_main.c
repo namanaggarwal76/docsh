@@ -182,6 +182,67 @@ static void schedule_checkpoint_repl(const char *file, const char *name, int pri
     pthread_t th; repq_inc(1); pthread_create(&th, NULL, repl_checkpoint_thread, a); pthread_detach(th);
 }
 
+// Fire-and-forget undo replicate to a target ssid (fetches from primary)
+typedef struct { char file[128]; int primary_ssid; int target_ssid; } repl_undo_args_t;
+static void *repl_undo_thread(void *arg) {
+    repl_undo_args_t *a = (repl_undo_args_t *)arg;
+    // Fetch undo from primary using READ ticket (undo is just a file)
+    int pport = 0; char paddr[64];
+    if (get_ss_info(a->primary_ssid, &pport, paddr, sizeof(paddr)) == 0 && pport) {
+        char ticket[256]; 
+        if (ticket_build(a->file, "READ", a->primary_ssid, 600, ticket, sizeof(ticket)) == 0) {
+            int sfd = tcp_connect(paddr, (uint16_t)pport);
+            if (sfd >= 0) {
+                // Build request to read undo file directly
+                char undo_file[256]; snprintf(undo_file, sizeof(undo_file), "../undo/%s.undo", a->file);
+                char req[512]; req[0]='\0';
+                json_put_string_field(req, sizeof(req), "type", "READ", 1);
+                json_put_string_field(req, sizeof(req), "file", undo_file, 0);
+                json_put_string_field(req, sizeof(req), "ticket", ticket, 0);
+                strncat(req, "}", sizeof(req)-strlen(req)-1);
+                if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
+                    char *resp = NULL; uint32_t rl = 0;
+                    if (recv_msg(sfd, &resp, &rl) == 0 && resp) {
+                        if (strstr(resp, "\"status\":\"OK\"")) {
+                            char body[8192]; body[0] = '\0';
+                            if (json_get_string_field(resp, "body", body, sizeof(body)) == 0) {
+                                // Now send to target SS
+                                int dport = 0; char dest_addr[64];
+                                if (get_ss_info(a->target_ssid, &dport, dest_addr, sizeof(dest_addr)) == 0 && dport) {
+                                    int dfd = tcp_connect(dest_addr, (uint16_t)dport);
+                                    if (dfd >= 0) {
+                                        char put_req[9216]; put_req[0]='\0';
+                                        json_put_string_field(put_req, sizeof(put_req), "type", "PUT_UNDO", 1);
+                                        json_put_string_field(put_req, sizeof(put_req), "file", a->file, 0);
+                                        json_put_string_field(put_req, sizeof(put_req), "body", body, 0);
+                                        strncat(put_req, "}", sizeof(put_req)-strlen(put_req)-1);
+                                        (void)send_msg(dfd, put_req, (uint32_t)strlen(put_req));
+                                        char *rr=NULL; uint32_t rrl=0; (void)recv_msg(dfd, &rr, &rrl);
+                                        if (rr) free(rr);
+                                        close(dfd);
+                                        fprintf(stderr, "[NM] Replicated UNDO %s -> ss%d\n", a->file, a->target_ssid);
+                                    }
+                                }
+                            }
+                        }
+                        free(resp);
+                    }
+                }
+                close(sfd);
+            }
+        }
+    }
+    repq_inc(-1);
+    free(a);
+    return NULL;
+}
+
+static void schedule_undo_repl(const char *file, int primary_ssid, int target_ssid) {
+    repl_undo_args_t *a = (repl_undo_args_t *)malloc(sizeof(*a)); if (!a) return;
+    snprintf(a->file, sizeof(a->file), "%s", file); a->primary_ssid = primary_ssid; a->target_ssid = target_ssid;
+    pthread_t th; repq_inc(1); pthread_create(&th, NULL, repl_undo_thread, a); pthread_detach(th);
+}
+
 // Fire-and-forget simple command replicate (CREATE/DELETE/RENAME)
 typedef struct { char type[16]; char file[128]; char newfile[128]; int target_ssid; } repl_cmd_args_t;
 static void *repl_cmd_thread(void *arg) {
@@ -249,7 +310,7 @@ static void *hb_monitor_thread(void *arg) {
                 if (promoted) (void)nm_state_save("nm_state.json");
             }
         }
-        sleep(2);
+        sleep(1);
     }
     return NULL;
 }
@@ -310,6 +371,51 @@ static void *client_thread(void *arg) {
             }
             add_ss(ssId, ctrl, data, ss_ip);
             printf("[NM] Registered SS id=%d ctrl=%d data=%d addr=%s\n", ssId, ctrl, data, ss_ip);
+            
+            // Immediately resync files where this SS is a replica (from saved state)
+            fprintf(stderr, "[NM] SS %d registered, checking for replicas to resync\n", ssId);
+            char files[512][128]; int ps[512]; size_t n = nm_state_get_dir(files, ps, 512);
+            for (size_t i=0;i<n;i++) {
+                int repls[16]; size_t nr = nm_state_get_replicas(files[i], repls, 16);
+                for (size_t j=0;j<nr;j++) if (repls[j]==ssId) {
+                    fprintf(stderr, "[NM] Resyncing file %s to newly registered ss%d\n", files[i], ssId);
+                    // Resync file content
+                    schedule_put_repl(files[i], ps[i], ssId);
+                    
+                    // Resync undo snapshot (if exists on primary)
+                    schedule_undo_repl(files[i], ps[i], ssId);
+                    
+                    // Best-effort: also resync checkpoints list and push each
+                    int pport=0; char paddr[64];
+                    if (get_ss_info(ps[i], &pport, paddr, sizeof(paddr)) == 0 && pport) {
+                        char ticket[256]; if (ticket_build(files[i], "LISTCHECKPOINTS", ps[i], 600, ticket, sizeof(ticket)) == 0) {
+                            int sfd = tcp_connect(paddr, (uint16_t)pport);
+                            if (sfd >= 0) {
+                                char req[512]; req[0]='\0'; json_put_string_field(req, sizeof(req), "type", "LISTCHECKPOINTS", 1); json_put_string_field(req, sizeof(req), "file", files[i], 0); json_put_string_field(req, sizeof(req), "ticket", ticket, 0); strncat(req, "}", sizeof(req)-strlen(req)-1);
+                                if (send_msg(sfd, req, (uint32_t)strlen(req)) == 0) {
+                                    char *r=NULL; uint32_t rl=0; if (recv_msg(sfd, &r, &rl) == 0 && r && strstr(r, "\"status\":\"OK\"")) {
+                                        const char *p = strchr(r, '['); if (p) {
+                                            p++;
+                                            while (*p && *p!=']') {
+                                                while (*p==' '||*p=='\n'||*p=='\t'||*p==',') p++;
+                                                if (*p=='"') {
+                                                    p++; const char *s=p; while(*p && *p!='"') p++; size_t nlen=(size_t)(p-s);
+                                                    char name[256]; if (nlen>=sizeof(name)) nlen=sizeof(name)-1; memcpy(name, s, nlen); name[nlen]='\0';
+                                                    if (*p=='"') p++;
+                                                    schedule_checkpoint_repl(files[i], name, ps[i], ssId);
+                                                } else break;
+                                            }
+                                        }
+                                    }
+                                    if (r) free(r);
+                                }
+                                close(sfd);
+                            }
+                        }
+                    }
+                }
+            }
+            
             const char *resp = "{\"status\":\"OK\"}";
             send_msg(fd, resp, (uint32_t)strlen(resp));
         } else if (strcmp(type, "SS_HEARTBEAT") == 0) {
@@ -327,7 +433,7 @@ static void *client_thread(void *arg) {
             // Only mark as UP if we know its data port (i.e., it REGISTERed before/after heartbeat)
             e->is_up = (e->ss_data_port != 0);
             pthread_mutex_unlock(&g_mu);
-            if (!was_up) {
+            if (!was_up && e->is_up) {
                 fprintf(stderr, "[NM] SS %d transitioned UP\n", ssId);
                 // Resync files where this SS is a replica
                 char files[512][128]; int ps[512]; size_t n = nm_state_get_dir(files, ps, 512);
@@ -336,6 +442,10 @@ static void *client_thread(void *arg) {
                     for (size_t j=0;j<nr;j++) if (repls[j]==ssId) {
                         // Resync file content
                         schedule_put_repl(files[i], ps[i], ssId);
+                        
+                        // Resync undo snapshot (if exists on primary)
+                        schedule_undo_repl(files[i], ps[i], ssId);
+                        
                         // Best-effort: also resync checkpoints list and push each
                         // Fetch checkpoint names from primary
                         int pport=0; char paddr[64];
