@@ -150,9 +150,32 @@ int nm_dir_rename(const char *old_file, const char *new_file) {
     int dummy = 0; if (map_get(new_file, &dummy) == 0) return 0;
     // Update persistence first
     if (!nm_state_rename_dir(old_file, new_file)) return 0;
-    // Remove old from map and LRU
-    nm_dir_del(old_file);
-    // Set new mapping
-    nm_dir_set(new_file, ssid);
+    
+    // Remove old from map (without touching persistence)
+    unsigned h = hash_str(old_file) % NBKT;
+    node_t *prev = NULL, *n = g_buckets[h];
+    while (n) {
+        if (strcmp(n->k, old_file) == 0) {
+            if (prev) prev->next = n->next; else g_buckets[h] = n->next;
+            free(n->k); free(n);
+            break;
+        }
+        prev = n; n = n->next;
+    }
+    
+    // Remove old from LRU (without touching persistence)
+    lru_node_t *ln = g_lru_head;
+    while (ln) {
+        if (strcmp(ln->k, old_file) == 0) {
+            if (ln->prev) ln->prev->next = ln->next; else g_lru_head = ln->next;
+            if (ln->next) ln->next->prev = ln->prev; else g_lru_tail = ln->prev;
+            free(ln->k); free(ln); g_lru_size--; break;
+        }
+        ln = ln->next;
+    }
+    
+    // Add new mapping to map and LRU
+    map_put(new_file, ssid);
+    lru_insert(new_file, ssid);
     return 1;
 }
