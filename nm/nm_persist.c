@@ -237,6 +237,18 @@ static void folder_map_remove(const char *path) {
     }
 }
 
+static void folder_map_update_index(const char *path, size_t new_index) {
+    unsigned h = hash_djb2(path);
+    folder_hash_node_t *node = g_state.folder_map[h];
+    while (node) {
+        if (strcmp(node->path, path) == 0) {
+            node->folder_index = new_index;
+            return;
+        }
+        node = node->next;
+    }
+}
+
 // Request hash map helpers
 static void req_map_insert(const char *file, size_t index) {
     unsigned h = hash_djb2(file);
@@ -273,6 +285,18 @@ static void req_map_remove(const char *file) {
             return;
         }
         prev = node;
+        node = node->next;
+    }
+}
+
+static void req_map_update_index(const char *file, size_t new_index) {
+    unsigned h = hash_djb2(file);
+    req_hash_node_t *node = g_state.req_map[h];
+    while (node) {
+        if (strcmp(node->file, file) == 0) {
+            node->req_index = new_index;
+            return;
+        }
         node = node->next;
     }
 }
@@ -1309,8 +1333,22 @@ int nm_acl_rename(const char *old_file, const char *new_file) {
     if (!e) return 0;
     // Ensure no destination exists
     if (find_acl(new_file)) return 0;
+    
+    // Get the index of this ACL entry before updating
+    int found = 0;
+    size_t index = acl_map_find(old_file, &found);
+    if (!found) return 0;
+    
+    // Remove old filename from hash map
+    acl_map_remove(old_file);
+    
+    // Update the filename in the ACL entry
     free(e->file);
     e->file = strdup(new_file);
+    
+    // Insert new filename into hash map with same index
+    acl_map_insert(new_file, index);
+    
     return 1;
 }
 
@@ -1382,7 +1420,11 @@ int nm_state_remove_folder(const char *path) {
             // Remove from hash map
             folder_map_remove(path);
             free(g_state.folders[i]);
-            if (i != g_state.n_folders - 1) g_state.folders[i] = g_state.folders[g_state.n_folders - 1];
+            if (i != g_state.n_folders - 1) {
+                g_state.folders[i] = g_state.folders[g_state.n_folders - 1];
+                // Update hash map index for swapped element
+                folder_map_update_index(g_state.folders[i], i);
+            }
             g_state.n_folders--;
             return 1;
         }
@@ -1407,14 +1449,22 @@ int nm_state_move_folder_prefix(const char *old_path, const char *new_path,
     // Update folders list: rename if exact match or update prefixes
     for (size_t i = 0; i < g_state.n_folders; ++i) {
         if (strcmp(g_state.folders[i], old_path) == 0) {
+            // Remove old path from hash map
+            folder_map_remove(g_state.folders[i]);
             free(g_state.folders[i]);
             g_state.folders[i] = strdup(new_path);
+            // Insert new path into hash map
+            folder_map_insert(new_path, i);
         } else if (strncmp(g_state.folders[i], old_path, oldlen) == 0 && g_state.folders[i][oldlen] == '/') {
             // nested folder
             const char *rest = g_state.folders[i] + oldlen;
             char buf[512]; snprintf(buf, sizeof(buf), "%s%s", new_path, rest);
+            // Remove old path from hash map
+            folder_map_remove(g_state.folders[i]);
             free(g_state.folders[i]);
             g_state.folders[i] = strdup(buf);
+            // Insert new path into hash map
+            folder_map_insert(buf, i);
         }
     }
     // Collect and update file mappings under prefix
@@ -1581,12 +1631,9 @@ int nm_state_clear_requests_for(const char *file) {
     free(e->file);
     if (e != &g_state.requests[g_state.n_requests-1]) {
         *e = g_state.requests[g_state.n_requests-1];
-        // No need to update hash map here since we're not tracking indices for requests
-        // Actually we need to update if we're using indexed hash map
-        // Re-insert the swapped element's hash entry
+        // Update hash map index for swapped element
         if (index != g_state.n_requests - 1) {
-            req_map_remove(g_state.requests[index].file);
-            req_map_insert(g_state.requests[index].file, index);
+            req_map_update_index(g_state.requests[index].file, index);
         }
     }
     g_state.n_requests--;
