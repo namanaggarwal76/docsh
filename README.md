@@ -1,12 +1,12 @@
-# DOCS+
+# DOCSH
 
-**Course Project for OSN (Monsoon 2025)**
+Course Project for OSN (Monsoon 2025)
 
-**Team members: Naman Aggarwal(2024101018), Manav Beriwal(2024101105)**
+Team members: Naman Aggarwal(2024101018), Manav Beriwal(2024101105)
 
-## 1️⃣ Project Overview
+## Project Overview
 
-**Docs++** is a distributed, multi-user document editing system built from scratch in C. It provides **sentence-level collaborative editing** with concurrent writes, access control, undo/redo via checkpoints, and transparent replication across multiple storage servers.
+**Docsh+** is a distributed, multi-user document editing system built from scratch in C. It provides **sentence-level collaborative editing** with concurrent writes, access control, undo/redo via checkpoints, and transparent replication across multiple storage servers.
 
 ### Key Design Decisions
 
@@ -17,11 +17,12 @@
 
 ---
 
-## 2️⃣ System Architecture
+## System Architecture
 
 ### 2.1 Components
 
 #### Name Server (NM)
+
 - **Role**: Routing, ACL enforcement, user session management, replication orchestration, persistence.
 - **State**: `nm_state.json` stores:
   - File → primary SS mapping
@@ -35,18 +36,22 @@
 - **Heartbeat Monitor**: Background thread marks SS down after 6s without heartbeat; promotes replicas on primary failure.
 
 #### Storage Server (SS)
+
 - **Role**: Persistent storage, sentence tokenization, write locks, UNDO snapshots, checkpoints.
 - **Data Layout** (per SS instance):
-  ```
+
+  ```bash
   ss_data/ss<ID>/
     files/         ← current file contents
     undo/          ← single-level undo snapshots
     checkpoints/   ← named checkpoint files per file
   ```
+
 - **Threading**: One pthread per client connection; global lock table protected by mutex.
 - **Write Session**: Stateful; holds lock + in-memory doc until END_WRITE.
 
 #### Client (CLI)
+
 - **Interactive Shell**: Command history (arrow keys), tab-free user prompt.
 - **Features**: Human-readable output (no raw JSON); colorized OK/ERROR (green/red); table formatting for lists.
 
@@ -64,7 +69,7 @@
 
 ### 2.3 High-Level Flow Diagram
 
-```
+```bash
 Client                 Name Server (NM)          SS (Primary)              SS (Replica)
    │                           │                      │                         │
    │── CREATE ───────────────> │                      │                         │
@@ -90,7 +95,7 @@ Client                 Name Server (NM)          SS (Primary)              SS (R
 
 ---
 
-## 3️⃣ Design Decisions
+## Design Decisions
 
 ### 3.1 Sentence Representation
 
@@ -98,7 +103,7 @@ Client                 Name Server (NM)          SS (Primary)              SS (R
   - Sentences end at `.`, `!`, `?` (delimiter attached to last word).
   - Words separated by whitespace.
   - In-memory: `ss_doc_tokens_t` → array of sentence arrays of word strings.
-  - On-disk: plain text. 
+  - On-disk: plain text.
 
 ### 3.2 Locking for Concurrency
 
@@ -141,11 +146,12 @@ Client                 Name Server (NM)          SS (Primary)              SS (R
   - Data server thread: accepts connections.
   - Per-connection thread: handles WRITE sessions.
   - Heartbeat thread: periodic ping to NM.
+
 ---
 
-## 4️⃣ Directory Structure
+## Directory Structure
 
-```
+```bash
 course-project-osint/
 ├── client/
 │   └── cli_main.c              # Interactive CLI with REPL, command parsing, human-readable output
@@ -176,6 +182,7 @@ course-project-osint/
 ```
 
 **Explanation**:
+
 - **client/**: User-facing CLI; no state.
 - **nm/**: Name Server logic; state in `nm_state.json`.
 - **ss/**: Storage Server logic; state in `ss_data/ss<ID>/`.
@@ -184,7 +191,7 @@ course-project-osint/
 
 ---
 
-## 5️⃣ Setup
+## Setup
 
 ### Compilation
 
@@ -193,11 +200,13 @@ make all
 ```
 
 This builds:
+
 - `bin/nm` (Name Server)
 - `bin/ss` (Storage Server)
 - `bin/client` (Client CLI)
 
 Clean build artifacts:
+
 ```bash
 make clean
 ```
@@ -206,56 +215,67 @@ make clean
 
 #### Single Machine Setup
 
-**Terminal 1: Name Server**
+##### Terminal 1: Name Server
+
 ```bash
 ./bin/nm 5000
 ```
 
-**Terminal 2: Storage Server #1**
+##### Terminal 2: Storage Server #1
+
 ```bash
 ./bin/ss 127.0.0.1 5000 6001 7001 1
 ```
+
 - Args: `<nm_host> <nm_port> <ss_ctrl_port> <ss_data_port> [ss_id]`
 - `ss_id` defaults to `ss_ctrl_port` if omitted.
 
-**Terminal 3: Storage Server #2**
+##### Terminal 3: Storage Server #2
+
 ```bash
 ./bin/ss 127.0.0.1 5000 6002 7002 2
 ```
 
-**Terminal 4: Client**
+##### Terminal 4: Client
+
 ```bash
 ./bin/client 127.0.0.1 5000
 ```
+
 - Connects to `127.0.0.1:5000` by default.
-- Prompts for username; enter a unique name. 
+- Prompts for username; enter a unique name.
 
 #### Multiple Devices Setup
 
 Ensure all machines are on the same network or have routable IPs.
 
 **On NM machine (e.g., IP `a.b.c.d`)**:
+
 ```bash
 ./bin/nm 5000
 ```
 
 **On Storage Server machine 1**:
+
 ```bash
 ./bin/ss a.b.c.d 5000 6001 7001 1
 ```
 
 **On Storage Server machine 2**:
+
 ```bash
 ./bin/ss a.b.c.d 5000 6002 7002 2
 ```
 
 **On any client machine**:
+
 ```bash
 ./bin/client a.b.c.d 5000
 ```
+
 ---
 
-## 6️⃣ How the System Works (Step-by-Step)
+## How the System Works (Step-by-Step)
 
 ### 6.1 Client Startup & Registration
 
@@ -312,11 +332,13 @@ Ensure all machines are on the same network or have routable IPs.
 5. Client enters interactive edit mode:
    - Prompts: `Enter <word_index> <content> lines; finish with ETIRW on its own line`
    - User enters:
-     ```
+
+     ```bash
      0 Hello
      1 world.
      ETIRW
      ```
+
 6. For each line (except `ETIRW`):
    - Client → SS: `APPLY {wordIndex: 0, content: "Hello"}`
    - SS: updates in-memory token array, returns `OK`.
@@ -394,52 +416,64 @@ Ensure all machines are on the same network or have routable IPs.
 
 ---
 
-## 7️⃣ Supported Commands
+## Supported Commands
 
 ### Basic File Operations
 
 #### `VIEW [-a] [-l]`
+
 List files. Flags:
+
 - `-a`: Show all files (admin mode).
 - `-l`: Detailed view (table with words, chars, last access time, owner).
 
 **Example**:
+
 ```bash
 VIEW
 VIEW -l
 ```
 
 #### `READ <file>`
+
 Print file contents.
 
 **Example**:
+
 ```bash
 READ demo.txt
 ```
 
 #### `CREATE <file> [-r] [-w]`
+
 Create empty file. Flags:
+
 - `-r`: Public read (anyone can READ without ACL).
 - `-w`: Public write (anyone can WRITE).
 
 **Example**:
+
 ```bash
 CREATE notes.txt
 CREATE public.txt -r -w
 ```
 
 #### `DELETE <file>`
+
 Soft-delete file (moves to trash). Owner-only.
 
 **Example**:
+
 ```bash
 DELETE notes.txt
 ```
 
 #### `INFO <file>`
+
 Show file metadata: owner, size, words, last modified/accessed (with user/time).
 
 **Example**:
+
 ```bash
 INFO notes.txt
 ```
@@ -447,12 +481,15 @@ INFO notes.txt
 ### Writing & Editing
 
 #### `WRITE <file> <sentenceIndex>`
+
 Start interactive write session on a sentence. Prompts:
-```
+
+```bash
 Enter <word_index> <content> lines; finish with ETIRW on its own line
 ```
 
 **Example**:
+
 ```bash
 WRITE notes.txt 0
 # Enter:
@@ -461,13 +498,16 @@ ETIRW
 ```
 
 **Notes**:
+
 - `word_index` starts at 0 within the sentence.
 - Session holds a lock until `ETIRW`.
 
 #### `UNDO <file>`
+
 Revert to last snapshot before most recent write. Single-level.
 
 **Example**:
+
 ```bash
 UNDO notes.txt
 ```
@@ -475,33 +515,41 @@ UNDO notes.txt
 ### Checkpoints & Versioning
 
 #### `CHECKPOINT <file> <name>`
+
 Save current file as a named checkpoint.
 
 **Example**:
+
 ```bash
 CHECKPOINT notes.txt v1
 ```
 
 #### `LISTCHECKPOINTS <file>`
+
 List all checkpoint tags for file.
 
 **Example**:
+
 ```bash
 LISTCHECKPOINTS notes.txt
 ```
 
 #### `VIEWCHECKPOINT <file> <name>`
+
 Print checkpoint content (read-only).
 
 **Example**:
+
 ```bash
 VIEWCHECKPOINT notes.txt v1
 ```
 
 #### `REVERT <file> <checkpointName>`
+
 Restore file to checkpoint (overwrites current).
 
 **Example**:
+
 ```bash
 REVERT notes.txt v1
 ```
@@ -509,34 +557,42 @@ REVERT notes.txt v1
 ### Folders & Rename/Move
 
 #### `CREATEFOLDER <path>`
+
 Create logical folder (no files yet).
 
 **Example**:
+
 ```bash
 CREATEFOLDER docs
 CREATEFOLDER docs/projects
 ```
 
 #### `VIEWFOLDER <path>`
+
 List files and folders in path.
 
 **Example**:
+
 ```bash
 VIEWFOLDER folder
 ```
 
 #### `RENAME <old> <new>`
+
 Rename file (NM updates mapping; SS renames file + undo + checkpoints).
 
 **Example**:
+
 ```bash
 RENAME old.txt new.txt
 ```
 
 #### `MOVE <src> <dst>`
+
 Move file to folder or rename.
 
 **Example**:
+
 ```bash
 MOVE notes.txt docs/notes.txt
 ```
@@ -544,25 +600,31 @@ MOVE notes.txt docs/notes.txt
 ### Trash Management
 
 #### `LISTTRASH`
+
 List all soft-deleted files (owner, trash path, timestamp).
 
 **Example**:
+
 ```bash
 LISTTRASH
 ```
 
 #### `RESTORE <file>`
+
 Restore file from trash (owner-only).
 
 **Example**:
+
 ```bash
 RESTORE notes.txt
 ```
 
 #### `EMPTYTRASH [<file>]`
+
 Permanently delete trashed files. Without arg: purge all owned by you. With arg: purge specific file.
 
 **Example**:
+
 ```bash
 EMPTYTRASH
 EMPTYTRASH notes.txt
@@ -571,36 +633,45 @@ EMPTYTRASH notes.txt
 ### Access Control
 
 #### `ADDACCESS -r|-w <file> <user>`
+
 Grant access. Modes:
+
 - `-r`: Read-only.
 - `-w`: Read+Write.
 
 **Example**:
+
 ```bash
 ADDACCESS -r notes.txt bob
 ADDACCESS -w notes.txt alice
 ```
 
 #### `REMACCESS <file> <user>`
+
 Revoke all access for user.
 
 **Example**:
+
 ```bash
 REMACCESS notes.txt bob
 ```
 
 #### `REQUEST_ACCESS <file> [-r|-w]`
+
 Submit access request (non-owners). Owner sees via `VIEWREQUESTS`.
 
 **Example**:
+
 ```bash
 REQUEST_ACCESS notes.txt -r
 ```
 
 #### `VIEWREQUESTS <file>`
+
 List pending access requests (owner-only).
 
 **Example**:
+
 ```bash
 VIEWREQUESTS notes.txt
 ```
@@ -608,9 +679,11 @@ VIEWREQUESTS notes.txt
 ### User Management
 
 #### `LIST`
+
 Show active and inactive users.
 
 **Example**:
+
 ```bash
 LIST
 ```
@@ -618,17 +691,21 @@ LIST
 ### Streaming & Execution
 
 #### `STREAM <file>`
+
 Stream file word-by-word (0.1s delay between words).
 
 **Example**:
+
 ```bash
 STREAM story.txt
 ```
 
 #### `EXEC <file>`
+
 Execute file as a shell script on NM. Output streams live; final line shows exit code.
 
 **Example**:
+
 ```bash
 EXEC tools/diag.sh
 ```
@@ -636,14 +713,16 @@ EXEC tools/diag.sh
 ### Utility
 
 #### `CLEAR`
+
 Clear terminal screen (ANSI escape).
 
-#### `EXIT` 
+#### `EXIT`
+
 Log out and exit client.
 
 ---
 
-## 8️⃣ Persistence
+## Persistence
 
 ### Name Server State
 
@@ -671,9 +750,9 @@ Log out and exit client.
 
 ---
 
-## 9️⃣ Caching & Efficient Search
+## Caching & Efficient Search
 
-#### Hash Map Implementation
+### Hash Map Implementation
 
 All NM data structures use **custom hash maps** with chaining for **O(1) average-case lookups**:
 
@@ -687,7 +766,8 @@ All NM data structures use **custom hash maps** with chaining for **O(1) average
   5. **Trash**: `trash_hash_node_t` - maps filename → trash entry index (O(1) restore/purge)
   6. **Directory**: `nm_dir.c` with 257-bucket hash map + 64-entry LRU cache (O(1) for LRU and hash access)
 
-#### Complexity Analysis
+### Complexity Analysis
+
 - File lookup: **O(1)** average, O(n) worst (hash collision chain)
 - ACL check: **O(1)** average - hash map to ACL index, then O(g)
 - User active check: **O(1)** average - direct hash map lookup
@@ -696,17 +776,20 @@ All NM data structures use **custom hash maps** with chaining for **O(1) average
 - Trash find: **O(1)** average - hash map to trash index
 
 **Trade-offs**:
+
 - Memory overhead: ~8KB for hash map buckets (256 buckets × 5 maps × 8 bytes/pointer)
 - Index maintenance: On delete, must update hash maps when swapping array elements
 - Collision handling: Uses chaining; average chain length < 2 for typical workloads (< 1000 entries)
 
-#### LRU Cache for Directory Lookups
+### LRU Cache for Directory Lookups
 
 The directory mapping (`nm_dir.c`) implements a **2-tier lookup**:
+
 1. **LRU Cache** (64 entries, doubly-linked list): Stores most recently accessed file mappings
 2. **Hash Map** (257 buckets): Full directory index
 
 **Workflow**:
+
 - Lookup: Check LRU → if miss, check hash map → promote to LRU head
 - Insert: Update hash map → update/insert LRU (evict tail if > 64 entries)
 - Delete: Remove from both hash map and LRU
@@ -718,12 +801,13 @@ The directory mapping (`nm_dir.c`) implements a **2-tier lookup**:
 
 ---
 
-## 1️⃣0️⃣ Logging
+## Logging
 
 ### Log Format
 
 **NM**:
-```
+
+```bash
 [NM] Registered SS id=1 ctrl=6001 data=7001 addr=127.0.0.1
 [NM] LOOKUP op=READ file=demo.txt have_op=1 have_file=1
 [NM] Replicated PUT demo.txt -> ss2
@@ -731,7 +815,8 @@ The directory mapping (`nm_dir.c`) implements a **2-tier lookup**:
 ```
 
 **SS**:
-```
+
+```bash
 [SS] accept cfd=4
 [SS] recv 42 bytes: {"type":"READ","file":"demo.txt","ticket":"..."}
 [SS] type=READ
@@ -752,13 +837,13 @@ The directory mapping (`nm_dir.c`) implements a **2-tier lookup**:
 
 ---
 
-## 1️⃣1️⃣ Error Handling
+## Error Handling
 
 ### Error Codes (Unified NM/SS)
 
 | Code                | Meaning                                      | Example Causes                                                                 |
-|---------------------|----------------------------------------------|-------------------------------------------------------------------------------|
-| `OK`                | Success                                      | -                                                                             |
+| ------------------- | -------------------------------------------- | -----------------------------------------------------------------------------  |
+| `OK`                | Success                                      |                                                                                |
 | `ERR_NOAUTH`        | Permission denied                            | ACL check failed; invalid/expired ticket                                       |
 | `ERR_NOTFOUND`      | Resource not found                           | File doesn't exist; checkpoint tag missing; undo snapshot missing              |
 | `ERR_LOCKED`        | Sentence locked by another writer            | Concurrent WRITE to same sentence                                              |
@@ -766,44 +851,3 @@ The directory mapping (`nm_dir.c`) implements a **2-tier lookup**:
 | `ERR_UNAVAILABLE`   | Service unavailable                          | No SS reachable; primary down and no replica; NM connection failed             |
 | `ERR_BADREQ`        | Bad request                                  | Missing fields; invalid indices; APPLY without active session; malformed JSON  |
 | `ERR_INTERNAL`      | Internal server error                        | I/O failure (permissions, disk full); unexpected state                         |
-
-
----
-
-## 1️⃣2️⃣ Bonus Features
-
-### ✅ Folders
-
-- **Logical Hierarchy**: NM stores folder paths; no physical directories (except in SS data).
-- **Commands**: `CREATEFOLDER`, `VIEWFOLDER`, `MOVE` (supports folder destinations).
-- **Implementation**: NM maintains vector of folder strings; prefix-based filtering for children.
-
-### ✅ Checkpoints
-
-- **Named Snapshots**: Save current file as `<name>.chk` in `checkpoints/<file>/`.
-- **Commands**: `CHECKPOINT`, `LISTCHECKPOINTS`, `VIEWCHECKPOINT`, `REVERT`.
-- **Storage**: SS stores full file copy per checkpoint (no delta/diff).
-- **Replication**: Checkpoints replicated to replicas on creation; resynced on SS UP.
-
-### ✅ Access Request System
-
-- **Workflow**:
-  1. Non-owner runs `REQUEST_ACCESS <file> [-r|-w]`.
-  2. NM stores pending request.
-  3. Owner runs `VIEWREQUESTS <file>` → sees list.
-  4. Owner grants via `ADDACCESS` → removes request.
-- **No Auto-Approval**: Manual owner action required.
-
-### ✅ Replication
-
-- **1+1 Setup**: Each file assigned one primary + one replica (if available).
-- **Async PUT**: NM spawns thread on `SS_COMMIT`, fetches from primary, sends to replica(s).
-- **Failover**: Heartbeat monitor promotes replica on primary down.
-- **Checkpoint Replication**: On `SS_CHECKPOINT`, NM replicates checkpoint file to replicas.
-
-### ✅ Trash Can (Soft Delete)
-
-- **DELETE** moves file to `.trash/<timestamp>_<escaped_name>` on SS; NM records metadata.
-- **LISTTRASH** shows all trashed items (owner, timestamp).
-- **RESTORE** renames back from trash (owner-only).
-- **EMPTYTRASH** permanently deletes (hard unlink).
